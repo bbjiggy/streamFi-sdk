@@ -345,6 +345,66 @@ fixed interval. A successful poll resets the failure count and the delay back to
 (after the final `onError` call for that failure) rather than retrying forever against a dead
 endpoint; call `subscribe()` again to restart it.
 
+> `subscribe()`/`subscribeAsync()` also accept an `onLedgerGap: (gap: LedgerGap) => void`
+> handler, called when two dispatched events are not from consecutive ledgers
+> (`nextLedger !== currentLedger + 1`). Unlike `onGap` (keyed on the contract's own sequence
+> topic), this is derived from every event's `ledger` field, so it also catches a skipped
+> ledger range that contained no events carrying a sequence topic at all. A detected gap
+> triggers an automatic backfill fetch for the missed range. See `LedgerGapDetector` under
+> `GraphQLIndexer` below.
+
+### `onStreamEvent(streamId, type, callback, options?) → Promise<Subscription>`
+
+A strongly-typed listener for a single named stream notification, decoding the payload
+automatically so callers don't wrangle raw Soroban XDR.
+
+```typescript
+const sub = await client.streams.onStreamEvent(streamId, 'Cancelled', (e) => {
+  console.log('refunded', e.refundAmount);
+});
+
+const cliffSub = await client.streams.onStreamEvent(streamId, 'CliffReached', (e) => {
+  console.log('cliff reached at', e.cliffTime);
+}, { cliffTime: vestingParams.cliffEndTime });
+```
+
+`'Cancelled'` is a real on-chain event — this delegates to the same decoding `subscribe()`
+uses for `onCancel`. `'CliffReached'` has no on-chain counterpart: the stream contract emits
+no cliff event, since a vesting cliff is a client-side scheduling convention (the stream's
+`startTime` set to the cliff end — see `examples/vesting-schedule.ts`), not contract state. It
+is a one-shot timer that calls `callback` once the wall clock reaches the required
+`options.cliffTime` (Unix seconds); `options.pollInterval` (default 5000ms) controls how often
+the clock is checked. Throws if `'CliffReached'` is requested without `options.cliffTime`.
+
+### `replayEvents(streamId, handlers, fromLedger, options?) → Promise<ReplayEventsResult>`
+
+Replays a stream's historical events over `[fromLedger, toLedger]`, dispatching each through
+the same decoder `subscribe()` uses for live polling.
+
+```typescript
+const result = await client.streams.replayEvents(streamId, {
+  onWithdraw: (e) => console.log('withdrew', e.amount),
+  onCancel:   (e) => console.log('cancelled', e.refundAmount),
+}, lastProcessedLedger + 1);
+
+console.log(`replayed ${result.dispatched} events up to ledger ${result.lastLedger}`);
+```
+
+An application reconnecting after being offline has no way to recover events it missed while
+down — `subscribe()` only sees events from the moment it (re)starts. Pass the last ledger the
+application successfully processed (or one past it) as `fromLedger` to backfill exactly what
+was missed, then resume `subscribe()`/`subscribeAsync()` for new events going forward.
+
+| Option | Type | Default |
+|--------|------|---------|
+| `toLedger` | `number` | the chain's latest ledger at call time |
+| `pageSize` | `number` (1–200) | 200 |
+| `maxPages` | `number` | 1000 |
+
+Returns `{ dispatched: number, lastLedger: number \| undefined }`. Throws if `fromLedger` is
+not a positive integer, if `toLedger` is less than `fromLedger`, or if more than `maxPages`
+pages are fetched before reaching `toLedger`.
+
 ---
 
 ## `client.factory`
@@ -507,6 +567,7 @@ out-of-range call still reaches the network and fails there (see [Error Codes](#
 | List pagination page size (max) | 100 | SDK, client-side — clamped before the request is sent so an oversized `limit` never reaches `streams_by_sender` / `streams_by_recipient` (see [#489](https://github.com/conduit-protocol/streamFi-sdk/issues/489)) | [`MAX_LIST_LIMIT`](../src/constants.ts) via [`clampListLimit()`](../src/constants.ts) |
 | Pagination `offset` | `[0, 2^32 - 1]` (valid `u32` range) | SDK, client-side | [`clampOffset()`](../src/constants.ts) |
 | `batchWithdraw` / builder batch size (default max) | 50 | SDK, client-side | `DEFAULT_MAX_BATCH_SIZE` in [`src/builder.ts`](../src/builder.ts) — not re-exported from `src/constants.ts`; override via `maxBatchSize` in `TransactionBatcher` options |
+| Soroban CPU instructions per transaction (mainnet) | 100,000,000 | Contract/network (Soroban resource limits) | [`DEFAULT_CPU_INSTRUCTION_LIMIT`](../src/fee-estimator.ts) — pre-flight-checked client-side via `estimateBatchFootprint()`, not enforced by the SDK before submission |
 
 **Note on client-side vs. contract enforcement:** where a bound is contract-enforced only
 (no SDK-side constant), the SDK does not pre-validate the value — it relies on the
@@ -516,6 +577,40 @@ dedicated exported constant in [`src/constants.ts`](../src/constants.ts); the du
 rate, deposit, and amount bounds above are contract-side only and should be treated as
 subject to change without a corresponding SDK release — always confirm against the
 deployed `DripGovernor` values for production use.
+
+---
+
+## Batch resource estimation
+
+### `estimateBatchFootprint(itemCount, options?) → ResourceEstimate`
+
+A synchronous, pre-execution estimate of a multi-stream batch withdrawal's Soroban CPU
+instruction footprint — no RPC call, nothing submitted or simulated on-chain. Soroban caps CPU
+instructions per transaction; a batch sized without regard for that limit only fails
+simulation after it's already been built. This gives a cheap pre-flight check so an oversized
+batch (e.g. 25 withdrawals) can be split before submission.
+
+```typescript
+import { estimateBatchFootprint } from '@conduit-protocol/sdk';
+
+const estimate = estimateBatchFootprint(25);
+if (estimate.exceedsThreshold) {
+  // split into chunks of estimate.recommendedMaxItems
+}
+```
+
+| Option | Type | Default |
+|--------|------|---------|
+| `instructionsPerItem` | `number` | `DEFAULT_INSTRUCTIONS_PER_BATCH_ITEM` (4,000,000) |
+| `fixedOverheadInstructions` | `number` | `DEFAULT_BATCH_FIXED_OVERHEAD_INSTRUCTIONS` (2,000,000) |
+| `cpuInstructionLimit` | `number` | `DEFAULT_CPU_INSTRUCTION_LIMIT` (100,000,000) |
+| `warnThreshold` | `number` (0, 1] | `DEFAULT_BATCH_WARN_THRESHOLD` (0.9) |
+
+Returns a `ResourceEstimate`: `{ itemCount, cpuInstructions, cpuInstructionLimit,
+utilizationRatio, exceedsThreshold, recommendedMaxItems }`. The per-item and overhead costs are
+heuristics calibrated from observed mainnet `withdraw` simulations — pass `options` to
+recalibrate them against your own contract's measured footprint. Throws if `itemCount` is not
+a positive integer, or if any option is out of its valid range.
 
 ---
 
@@ -799,6 +894,35 @@ const sub = indexer.subscribe({
 sub.unsubscribe();
 indexer.cleanup();
 ```
+
+### `LedgerGapDetector`
+
+Tracks a monotonically increasing ledger sequence and flags a skip, independently of any
+particular RPC transport — feed it any sequence of ledger numbers (e.g. `event.ledger` from a
+poller) and it reports a gap without needing to know where those numbers came from.
+
+```typescript
+import { LedgerGapDetector } from '@conduit-protocol/sdk';
+
+const detector = new LedgerGapDetector();
+detector.observe(100);        // undefined — first observation
+detector.observe(105);        // { expected: 101, actual: 105 }
+detector.currentLedger;       // 105
+detector.reset();             // forget tracked state
+```
+
+* `observe(ledger: number): LedgerGap | undefined` — records the next observed ledger.
+  Returns `{ expected, actual }` when `ledger` is not exactly one past the previously observed
+  value; returns `undefined` for a contiguous, duplicate, or re-ordered (behind-current) value.
+  Throws if `ledger` is not a non-negative integer.
+* `currentLedger: number | undefined` — the last observed ledger, or `undefined` before the
+  first `observe()` call.
+* `reset(): void` — clears the tracked ledger so the next `observe()` call can't be flagged.
+
+`client.streams.subscribe()`/`subscribeAsync()` (see `client.streams` above) use this
+internally to catch a skipped ledger during a network hiccup even when no event carrying the
+contract's own sequence topic bracketed it, firing `onLedgerGap` and an automatic backfill
+fetch.
 
 ---
 
