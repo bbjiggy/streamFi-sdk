@@ -134,6 +134,25 @@ When both `fee` and `feeMultiplier` are present, `fee` wins. The precedence is:
 
 Use `resolveFee(config)` to compute the effective fee for a given `ConduitConfig`.
 
+### Dynamic Fee Estimation
+
+`FeeEstimator` tracks a live inclusion fee from Horizon's `/fee_stats`, with two ways to read it:
+
+```typescript
+import { FeeEstimator } from '@conduit-protocol/sdk';
+
+const estimator = new FeeEstimator(100n); // 100n = fallback base fee in stroops
+
+// Fixed multiplier applied to the modal fee charged in recent ledgers.
+const urgentFee = await estimator.getDynamicFee({ priority: 'urgent' }); // 'low' | 'standard' | 'urgent' | custom multiplier
+
+// Recent-ledger fee percentiles — moves with real congestion, including
+// spikes a fixed multiplier would under- or over-shoot.
+const { p75, p95 } = await estimator.getLedgerFeeStats();
+```
+
+Both share the `feeMultiplier` safety-margin buffer passed to the `FeeEstimator` constructor, and both fall back to the last successfully fetched value on a network error.
+
 ### WalletConnect v2 Integration (Mobile & Browser Wallets)
 
 For web and mobile applications using WalletConnect v2:
@@ -288,6 +307,23 @@ const result = await batcher.executeAsync(
 console.log('Batch Success:', result.success);
 console.log('Operations:', result.operations);
 console.log('Transaction XDR:', result.xdr);
+```
+
+Dry-run a batch before prompting for wallet signatures with `simulateBatch()` —
+it simulates every operation and tells you exactly which one(s) would revert
+(e.g. an invalid recipient address), without spending an inclusion fee:
+
+```typescript
+import { simulateBatch } from '@conduit-protocol/sdk';
+
+const summary = await simulateBatch({
+  operations: [stream1.toBatchOperation(), stream2.toBatchOperation()],
+  context: { network: 'testnet', contractId: 'C...', sourceAccount: 'GABC...SENDER', rpcUrl: 'https://soroban-testnet.stellar.org' },
+});
+
+if (!summary.success) {
+  console.log('Operations that would revert:', summary.invalidIndices);
+}
 ```
 
 ---
@@ -511,8 +547,23 @@ const { ids } = await client.factory.streamsBySender(sender, 0, 50);
 const addresses = await client.factory.streamAddresses(ids);
 // Map<string, string | null>, keyed by decimal stream-id string
 
+// Cursor-paginated variant of streamsBySender — pass the previous page's
+// `cursor` back in to continue; `cursor` is `null` on the last page.
+let cursor: string | undefined;
+do {
+  const page = await client.factory.getStreamsBySenderPaginated(sender, cursor, 50);
+  console.log(page.ids);
+  cursor = page.cursor ?? undefined;
+} while (cursor);
+
 // Protocol fee in basis points (e.g. 30 = 0.3%)
 const feeBps = await client.factory.protocolFeeBps();
+
+// feeBps + feeRecipient together, cached for `factoryConfigCacheTtlMs`
+// (default 5 minutes) so stream-creation-heavy callers don't pay a
+// simulation per call for data that rarely changes.
+const { feeBps: cachedFeeBps, feeRecipient } = await client.factory.getFactoryConfig();
+client.factory.clearFactoryConfigCache(); // force the next call to re-simulate
 ```
 
 ---

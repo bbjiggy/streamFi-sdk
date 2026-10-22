@@ -147,6 +147,15 @@ export interface ConduitConfig {
    */
   governorConfigCacheTtlMs?: number;
   /**
+   * How long a `FactoryModule.getFactoryConfig()` read (`feeBps`,
+   * `feeRecipient`) is reused, in milliseconds (#958). Factory protocol
+   * parameters rarely change, so a stream-creation-heavy caller should not
+   * pay a simulation per call for data that is almost always unchanged.
+   * Default 300_000 (5 minutes). Set `0` to disable the cache and
+   * re-simulate on every call.
+   */
+  factoryConfigCacheTtlMs?: number;
+  /**
    * Custom `fetch` used for Soroban RPC requests and for the fee estimator's
    * Horizon `/fee_stats` call — for edge runtimes (Cloudflare Workers),
    * proxies/custom HTTP agents, request-tracing headers, or timeouts that the
@@ -279,6 +288,14 @@ export interface GovernorConfig {
   votingDelay?: number;
   votingPeriod?: number;
   proposalThreshold?: bigint;
+}
+
+/** Cached result of `FactoryModule.getFactoryConfig()` (#958). */
+export interface FactoryConfig {
+  /** Current protocol fee in basis points (e.g. 30 = 0.3%). */
+  feeBps: number;
+  /** Address the protocol fee is paid to, when the factory reports one. */
+  feeRecipient?: string;
 }
 
 // ── Events ──────────────────────────────────────────────────────────────────

@@ -359,6 +359,42 @@ export async function preBatchSimulate(
 }
 
 /**
+ * A batch's operations and build context, bundled into one value so a dry
+ * run can be requested with a single argument instead of two positional
+ * ones (#959).
+ */
+export interface BatchPayload {
+  operations: BuildableOperation[];
+  context: BatchTransactionContext;
+}
+
+/** Aggregate result of {@link simulateBatch}. */
+export interface BatchSimulationSummary {
+  /** `true` only when every operation in the batch simulated successfully. */
+  success: boolean;
+  /** Per-operation simulation results, in input order. */
+  results: BatchSimulationResult[];
+  /** Indices of operations that failed simulation, in input order. */
+  invalidIndices: number[];
+}
+
+/**
+ * Dry-run a whole batch before prompting for wallet signatures (#959).
+ *
+ * Thin wrapper over {@link preBatchSimulate} that takes the operations and
+ * context as one {@link BatchPayload} and folds the per-operation results
+ * into a single pass/fail verdict, so a caller can gate signing on
+ * `result.success` instead of scanning `results` itself. `invalidIndices`
+ * still identifies exactly which operation(s) would revert — e.g. an
+ * invalid recipient address — without spending any inclusion fee.
+ */
+export async function simulateBatch(batch: BatchPayload): Promise<BatchSimulationSummary> {
+  const results = await preBatchSimulate(batch.operations, batch.context);
+  const invalidIndices = results.filter(r => !r.success).map(r => r.index);
+  return { success: invalidIndices.length === 0, results, invalidIndices };
+}
+
+/**
  * Build one transaction per operation and prepare each via RPC simulation, so
  * the returned XDR carries its footprint and auth and is ready to submit.
  *

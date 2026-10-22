@@ -15,6 +15,7 @@ export {
   buildBatchTransactions,
   buildBatchTransactionsSync,
   preBatchSimulate,
+  simulateBatch,
   BatchBuildError,
   BatchPartiallySubmittedError,
   submitBatch,
@@ -30,6 +31,8 @@ export type {
   BatchSubmitOptions,
   BatchSimulationResult,
   BuildableOperation,
+  BatchPayload,
+  BatchSimulationSummary,
 } from "./batch-tx.js";
 export {
   GraphQLIndexer,
@@ -121,6 +124,7 @@ export type {
   FeeEstimateOptions,
   FeePriority,
   DynamicFeeOptions,
+  LedgerFeeStats,
 } from "./fee-estimator.js";
 export { coalesceAsync, coalesceInFlight } from "./coalesce-async.js";
 export { WebSocketRelayer } from "./relayer/WebSocketRelayer.js";
@@ -268,6 +272,7 @@ export { FactoryModule } from "./factory.js";
 export type {
   FactoryStreamListResult,
   StreamAddressesOptions,
+  PaginatedStreamIdsResult,
 } from "./factory.js";
 export {
   GovernorModule,
