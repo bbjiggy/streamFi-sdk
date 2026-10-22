@@ -218,6 +218,62 @@ function findPaginatedCollection(value: unknown): PaginatedCollection | undefine
 }
 
 
+/** A detected skip in an otherwise-monotonic ledger sequence. */
+export interface LedgerGap {
+  /** The ledger sequence that should have come next (`currentLedger + 1`). */
+  expected: number;
+  /** The ledger sequence actually observed. */
+  actual: number;
+}
+
+/**
+ * Tracks a monotonically increasing ledger sequence and flags a skip —
+ * `nextLedger !== currentLedger + 1` — so a streaming poller can trigger a
+ * backfill fetch instead of silently continuing past missed ledgers (a
+ * network hiccup during polling would otherwise corrupt off-chain balance
+ * indexing and state projections built from the stream).
+ *
+ * This is framework-agnostic: feed it any monotonically-intended ledger
+ * sequence (e.g. each dispatched event's `event.ledger`) from whichever
+ * poller observes it.
+ */
+export class LedgerGapDetector {
+  private current: number | undefined;
+
+  /** The last ledger sequence observed, or `undefined` before the first `observe()` call. */
+  get currentLedger(): number | undefined {
+    return this.current;
+  }
+
+  /**
+   * Records the next observed ledger sequence.
+   *
+   * Returns the detected {@link LedgerGap} if `ledger` is not exactly one
+   * past the previously observed ledger, otherwise `undefined`. A `ledger`
+   * at or behind the current value (a duplicate or re-ordered delivery) is
+   * recorded without being treated as a gap.
+   */
+  observe(ledger: number): LedgerGap | undefined {
+    if (!Number.isInteger(ledger) || ledger < 0) {
+      throw new Error(`LedgerGapDetector.observe: ledger must be a non-negative integer, got ${String(ledger)}`);
+    }
+
+    let gap: LedgerGap | undefined;
+    if (this.current !== undefined && ledger > this.current + 1) {
+      gap = { expected: this.current + 1, actual: ledger };
+    }
+    if (this.current === undefined || ledger > this.current) {
+      this.current = ledger;
+    }
+    return gap;
+  }
+
+  /** Clears the tracked ledger so the next `observe()` call cannot be flagged as a gap. */
+  reset(): void {
+    this.current = undefined;
+  }
+}
+
 export class GraphQLIndexer {
   private endpoint: string;
   private readonly onQueryMetric: ((metric: IndexerQueryMetric) => void) | undefined;

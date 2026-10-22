@@ -9,6 +9,116 @@ const DEFAULT_PRIORITY_MULTIPLIERS: Record<FeePriority, number> = {
 
 const DEFAULT_HORIZON_URL = 'https://horizon.stellar.org';
 
+/** Soroban's per-transaction CPU instruction ceiling on Stellar mainnet. */
+export const DEFAULT_CPU_INSTRUCTION_LIMIT = 100_000_000;
+
+/**
+ * Estimated CPU instructions consumed by one batched withdraw operation
+ * (contract invocation, auth verification, storage read/write), calibrated
+ * from observed mainnet simulation results for `withdraw`.
+ */
+export const DEFAULT_INSTRUCTIONS_PER_BATCH_ITEM = 4_000_000;
+
+/**
+ * Fixed per-transaction CPU overhead (envelope decoding, auth-entry
+ * verification, footprint merge) that doesn't scale with batch size.
+ */
+export const DEFAULT_BATCH_FIXED_OVERHEAD_INSTRUCTIONS = 2_000_000;
+
+/** Default fraction of {@link DEFAULT_CPU_INSTRUCTION_LIMIT} at which {@link estimateBatchFootprint} flags a batch. */
+export const DEFAULT_BATCH_WARN_THRESHOLD = 0.9;
+
+export interface BatchFootprintOptions {
+  /** CPU instructions consumed per batch item. Default {@link DEFAULT_INSTRUCTIONS_PER_BATCH_ITEM}. */
+  instructionsPerItem?: number;
+  /** Fixed per-transaction overhead instructions. Default {@link DEFAULT_BATCH_FIXED_OVERHEAD_INSTRUCTIONS}. */
+  fixedOverheadInstructions?: number;
+  /** Network CPU instruction ceiling per transaction. Default {@link DEFAULT_CPU_INSTRUCTION_LIMIT}. */
+  cpuInstructionLimit?: number;
+  /** Utilization fraction (0-1] above which `exceedsThreshold` is set. Default {@link DEFAULT_BATCH_WARN_THRESHOLD}. */
+  warnThreshold?: number;
+}
+
+/** Pre-execution estimate of a batch's Soroban CPU instruction footprint. */
+export interface ResourceEstimate {
+  /** The `itemCount` the estimate was computed for. */
+  itemCount: number;
+  /** Estimated total CPU instructions the batch will consume. */
+  cpuInstructions: number;
+  /** The CPU instruction ceiling the estimate was computed against. */
+  cpuInstructionLimit: number;
+  /** `cpuInstructions / cpuInstructionLimit`. Can exceed 1 for a batch that will not fit in a single transaction. */
+  utilizationRatio: number;
+  /** `true` once `utilizationRatio` passes the configured `warnThreshold`. */
+  exceedsThreshold: boolean;
+  /** The largest `itemCount` that stays at or under `warnThreshold`, for splitting an oversized batch. */
+  recommendedMaxItems: number;
+}
+
+/**
+ * Estimates the Soroban CPU instruction footprint of a multi-stream batch
+ * withdrawal, without submitting or simulating anything on-chain.
+ *
+ * Soroban caps CPU instructions per transaction; a batch sized without
+ * regard for that limit fails simulation only after the caller has already
+ * built it. This gives clients a cheap, synchronous pre-flight check so they
+ * can split an oversized batch — e.g. 25 withdrawals — before submission.
+ *
+ * The per-item and overhead costs are heuristics (see
+ * {@link DEFAULT_INSTRUCTIONS_PER_BATCH_ITEM}); pass `options` to recalibrate
+ * them against your own contract's measured simulation footprint.
+ *
+ * @example
+ * const estimate = estimateBatchFootprint(25);
+ * if (estimate.exceedsThreshold) {
+ *   // split into chunks of estimate.recommendedMaxItems
+ * }
+ */
+export function estimateBatchFootprint(
+  itemCount: number,
+  options: BatchFootprintOptions = {},
+): ResourceEstimate {
+  if (!Number.isInteger(itemCount) || itemCount < 1) {
+    throw new Error(`itemCount must be a positive integer, got ${String(itemCount)}`);
+  }
+
+  const instructionsPerItem = options.instructionsPerItem ?? DEFAULT_INSTRUCTIONS_PER_BATCH_ITEM;
+  const fixedOverheadInstructions = options.fixedOverheadInstructions ?? DEFAULT_BATCH_FIXED_OVERHEAD_INSTRUCTIONS;
+  const cpuInstructionLimit = options.cpuInstructionLimit ?? DEFAULT_CPU_INSTRUCTION_LIMIT;
+  const warnThreshold = options.warnThreshold ?? DEFAULT_BATCH_WARN_THRESHOLD;
+
+  if (!Number.isFinite(instructionsPerItem) || instructionsPerItem < 0) {
+    throw new Error(`instructionsPerItem must be a non-negative finite number, got ${String(instructionsPerItem)}`);
+  }
+  if (!Number.isFinite(fixedOverheadInstructions) || fixedOverheadInstructions < 0) {
+    throw new Error(`fixedOverheadInstructions must be a non-negative finite number, got ${String(fixedOverheadInstructions)}`);
+  }
+  if (!Number.isFinite(cpuInstructionLimit) || cpuInstructionLimit <= 0) {
+    throw new Error(`cpuInstructionLimit must be a positive finite number, got ${String(cpuInstructionLimit)}`);
+  }
+  if (!Number.isFinite(warnThreshold) || warnThreshold <= 0 || warnThreshold > 1) {
+    throw new Error(`warnThreshold must be a finite number in (0, 1], got ${String(warnThreshold)}`);
+  }
+
+  const cpuInstructions = fixedOverheadInstructions + instructionsPerItem * itemCount;
+  const utilizationRatio = cpuInstructions / cpuInstructionLimit;
+  const exceedsThreshold = utilizationRatio > warnThreshold;
+
+  const usableInstructions = Math.max(0, cpuInstructionLimit * warnThreshold - fixedOverheadInstructions);
+  const recommendedMaxItems = instructionsPerItem > 0
+    ? Math.max(1, Math.floor(usableInstructions / instructionsPerItem))
+    : itemCount;
+
+  return {
+    itemCount,
+    cpuInstructions,
+    cpuInstructionLimit,
+    utilizationRatio,
+    exceedsThreshold,
+    recommendedMaxItems,
+  };
+}
+
 export interface DynamicFeeOptions extends FeeEstimateOptions {
   /** Priority tier, or a custom numeric multiplier (>= 1). Defaults to `'standard'`. */
   priority?: FeePriority | number;

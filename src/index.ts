@@ -48,7 +48,9 @@ export {
   GraphQLIndexer,
   DEFAULT_INDEXER_TIMEOUT_MS,
   DEFAULT_INDEXER_MAX_PAGES,
+  LedgerGapDetector,
 } from "./indexer.js";
+export type { LedgerGap } from "./indexer.js";
 export { MockGraphQLIndexer, createMockIndexer } from "./mock-indexer.js";
 export type {
   MockQueryMap,
@@ -128,13 +130,21 @@ export type {
 } from "./types/index.js";
 export * from "./adapters/index.js";
 export * from "./react/index.js";
-export { FeeEstimator } from "./fee-estimator.js";
+export {
+  FeeEstimator,
+  estimateBatchFootprint,
+  DEFAULT_CPU_INSTRUCTION_LIMIT,
+  DEFAULT_INSTRUCTIONS_PER_BATCH_ITEM,
+  DEFAULT_BATCH_FIXED_OVERHEAD_INSTRUCTIONS,
+  DEFAULT_BATCH_WARN_THRESHOLD,
+} from "./fee-estimator.js";
 export type {
   FeeEstimatorOptions,
   FeeEstimateOptions,
   FeePriority,
   DynamicFeeOptions,
-  LedgerFeeStats,
+  BatchFootprintOptions,
+  ResourceEstimate,
 } from "./fee-estimator.js";
 export { coalesceAsync, coalesceInFlight } from "./coalesce-async.js";
 export { WebSocketRelayer } from "./relayer/WebSocketRelayer.js";
@@ -300,6 +310,9 @@ export type {
   StreamHistoryEntry,
   StreamHistoryPage,
   StreamHistoryOptions,
+  CliffReachedListenerOptions,
+  ReplayEventsOptions,
+  ReplayEventsResult,
 } from "./events.js";
 export type {
   GovernorProposal,
