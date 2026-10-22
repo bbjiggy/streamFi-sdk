@@ -46,6 +46,48 @@ import type { Network } from './types/index.js';
 export const DEFAULT_BATCH_TIMEOUT_SECONDS = 30;
 
 /**
+ * Split a flat list of batch operations into chunks small enough to fit
+ * Soroban's per-transaction instruction / footprint limits.
+ *
+ * A single Soroban transaction may only carry a bounded amount of work;
+ * trying to invoke 500 payroll withdrawals in one envelope reverts the whole
+ * thing. Callers pass the full list together with a safe `maxChunkSize`
+ * (default 50 — the figure the dashboard uses for payroll batches) and submit
+ * each returned chunk as its own transaction set, so one oversized list never
+ * takes the entire batch down.
+ *
+ * An empty input yields `[]` rather than a single empty chunk, so a caller
+ * that maps over the result does not emit a stray no-op batch. Order is
+ * preserved: `concat(...chunks)` is item-identical to the input.
+ *
+ * @param items - The operations to split (any element type).
+ * @param maxChunkSize - Maximum entries per chunk. Must be a positive integer;
+ *   values below 1 throw rather than silently collapsing the whole list into
+ *   one oversized chunk that would revert on-chain.
+ * @returns An array of chunks; `[items]` when `items.length <= maxChunkSize`.
+ *
+ * @example
+ * ```ts
+ * const chunks = chunkBatchOperations(payroll, 50); // 500 items -> 10 of 50
+ * for (const chunk of chunks) await submitBatch(buildBatchTransactions(chunk, ctx), rpcUrl);
+ * ```
+ */
+export function chunkBatchOperations<T>(items: T[], maxChunkSize = 50): T[][] {
+  if (!Array.isArray(items)) {
+    throw new BatchBuildError('chunkBatchOperations expects an array of items');
+  }
+  if (!Number.isInteger(maxChunkSize) || maxChunkSize < 1) {
+    throw new BatchBuildError(`maxChunkSize must be a positive integer, got ${String(maxChunkSize)}`);
+  }
+  if (items.length === 0) return [];
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += maxChunkSize) {
+    chunks.push(items.slice(i, i + maxChunkSize));
+  }
+  return chunks;
+}
+
+/**
  * Everything needed to turn a validated operation list into real transactions.
  *
  * Supply `sequence` to build offline, or `rpcUrl` to fetch the sequence and
