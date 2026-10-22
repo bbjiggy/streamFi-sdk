@@ -1,4 +1,5 @@
 import type { Signer } from "../signer.js";
+import type { LedgerGap } from "../indexer.js";
 
 export type Network = "mainnet" | "testnet" | "local";
 
@@ -392,6 +393,21 @@ export interface EventGap {
   actual: bigint;
 }
 
+/**
+ * Payload delivered by `onStreamEvent(..., 'CliffReached', ...)`.
+ *
+ * Unlike the other event payloads, this has no on-chain topic: the stream
+ * contract does not emit a cliff event, since "cliff" is a vesting-schedule
+ * convention (see `examples/vesting-schedule.ts`) rather than contract
+ * state — a vesting cliff is just a stream whose `startTime` is set to the
+ * cliff end, so nothing accrues before it. `cliffTime` is the caller-supplied
+ * timestamp this notification fired against.
+ */
+export interface CliffReachedEvent {
+  /** Unix timestamp (seconds) at which the cliff was reached. */
+  cliffTime: number;
+}
+
 /** Maps each handler-facing event name to its decoded payload type. */
 export interface EventPayloadMap {
   withdraw: WithdrawEvent;
@@ -435,6 +451,15 @@ export interface StreamEventHandlers {
   onError?: (error: Error) => void;
   /** Called when a non-contiguous event sequence is observed (missed events across a poll gap or reconnect). */
   onGap?: (gap: EventGap) => void;
+  /**
+   * Called when two consecutively dispatched events are not from
+   * consecutive ledgers, i.e. `nextLedger !== currentLedger + 1`. Unlike
+   * `onGap` (keyed on the contract's own `topics[2]` sequence), this is
+   * derived from Soroban's `event.ledger` field, so it also catches skips
+   * for event types that don't carry a sequence topic. A detected gap
+   * triggers an automatic backfill fetch for the missed ledger range.
+   */
+  onLedgerGap?: (gap: LedgerGap) => void;
   /** Polling interval in ms; default 5000 */
   pollInterval?: number;
   /**

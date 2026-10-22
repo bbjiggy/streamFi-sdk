@@ -35,7 +35,9 @@ export {
   GraphQLIndexer,
   DEFAULT_INDEXER_TIMEOUT_MS,
   DEFAULT_INDEXER_MAX_PAGES,
+  LedgerGapDetector,
 } from "./indexer.js";
+export type { LedgerGap } from "./indexer.js";
 export { MockGraphQLIndexer, createMockIndexer } from "./mock-indexer.js";
 export type {
   MockQueryMap,
