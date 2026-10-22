@@ -1,5 +1,6 @@
+import { SorobanRpc } from '@stellar/stellar-sdk';
 import type { WebSocketRelayer, WebSocketMessage, MessageHandler } from './WebSocketRelayer.js';
-import { ConduitError, type ConduitContract } from '../errors.js';
+import { ConduitError, SorobanRpcError, type ConduitContract } from '../errors.js';
 
 export type MappedErrorHandler = (error: Error) => void;
 export type ErrorMessageTypeMap = Record<string, ConduitContract>;
@@ -95,4 +96,41 @@ export class ErrorMapper {
     this.isDisposed = true;
     this.detach();
   }
+}
+
+/**
+ * Extracts a human-readable diagnostic message from a Soroban simulation
+ * response (#921).
+ *
+ * Simulation failures carry their root cause buried in diagnostic host log
+ * events rather than in a plain error string. Reuses {@link SorobanRpcError}'s
+ * existing diagnostic decoding — host function call stack and auth failure
+ * extraction — instead of re-implementing a second parser here.
+ *
+ * @param simResult - The simulation response from the Soroban RPC.
+ * @returns A readable one-line diagnostic message. For a successful
+ *   simulation, or an error with no decodable diagnostics, falls back to
+ *   the raw RPC error string (or a generic message).
+ */
+export function extractDiagnosticMessage(simResult: SorobanRpc.Api.SimulateTransactionResponse): string {
+  if (!SorobanRpc.Api.isSimulationError(simResult)) {
+    return 'Simulation succeeded; no diagnostic message to extract.';
+  }
+
+  const { diagnostics } = SorobanRpcError.fromSimulationError({
+    error: simResult.error,
+    events: simResult.events,
+  });
+
+  const parts: string[] = [diagnostics.rpcError];
+
+  if (diagnostics.authFailureReasons) {
+    parts.push(`Auth failure: ${diagnostics.authFailureReasons.join('; ')}`);
+  }
+
+  if (diagnostics.hostFunctionCallStack) {
+    parts.push(`Call stack: ${diagnostics.hostFunctionCallStack.join(' -> ')}`);
+  }
+
+  return parts.join(' | ');
 }

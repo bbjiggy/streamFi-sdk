@@ -127,6 +127,7 @@ export { WebSocketRelayer } from "./relayer/WebSocketRelayer.js";
 export {
   ErrorMapper,
   DEFAULT_ERROR_MESSAGE_TYPE_MAP,
+  extractDiagnosticMessage,
 } from "./relayer/ErrorMapper.js";
 export type {
   MappedErrorHandler,
