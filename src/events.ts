@@ -582,6 +582,62 @@ export interface StreamHistoryPage {
   nextCursor: string | undefined;
 }
 
+/**
+ * A single decoded stream event, discriminated by its `kind` field so
+ * consumer code can `switch` on it for type-safe handling — the strongly
+ * typed counterpart to the raw `SorobanRpc` `EventResponse` that the network
+ * returns. This is the "parsing function" that turns contract event topics
+ * into a TypeScript discriminated union (#908): each member carries the
+ * already-decoded payload (`CreatedEvent`, `WithdrawEvent`, …).
+ *
+ * It mirrors the shape `getStreamHistory` assembles internally; exposing it
+ * lets callers parse one event without standing up a full history page.
+ */
+export type StreamEvent =
+  | { kind: 'created'; event: CreatedEvent }
+  | { kind: 'withdrawn'; event: WithdrawEvent }
+  | { kind: 'topped_up'; event: StreamTopUpEvent }
+  | { kind: 'paused'; event: PauseEvent }
+  | { kind: 'resumed'; event: ResumeEvent }
+  | { kind: 'cancelled'; event: CancelEvent }
+  | { kind: 'clawback'; event: StreamClawbackedEvent }
+  | { kind: 'force_cancelled'; event: ForceCancelEvent }
+  | { kind: 'recipient_transferred'; event: RecipientTransferEvent }
+  | { kind: 'operator_set'; event: OperatorSetEvent }
+  | { kind: 'operator_revoked'; event: OperatorRevokedEvent };
+
+/**
+ * Parse one raw contract `EventResponse` into a typed {@link StreamEvent}, or
+ * `null` when the topic is not a recognised stream event (the dispatch layer
+ * simply has no handler registered for it).
+ *
+ * @example
+ * ```ts
+ * const ev = parseStreamEvent(raw);
+ * if (ev) switch (ev.kind) {
+ *   case 'created':   console.log(ev.event.recipient); break;
+ *   case 'withdrawn': console.log(ev.event.amount); break;
+ * }
+ * ```
+ */
+export function parseStreamEvent(event: SorobanRpc.Api.EventResponse): StreamEvent | null {
+  let result: StreamEvent | null = null;
+  dispatchEvent(event, {
+    onCreated:           (event) => { result = { kind: 'created', event }; },
+    onWithdraw:          (event) => { result = { kind: 'withdrawn', event }; },
+    onTopUp:             (event) => { result = { kind: 'topped_up', event }; },
+    onPause:             (event) => { result = { kind: 'paused', event }; },
+    onResume:            (event) => { result = { kind: 'resumed', event }; },
+    onCancel:            (event) => { result = { kind: 'cancelled', event }; },
+    onClawback:          (event) => { result = { kind: 'clawback', event }; },
+    onForceCancel:       (event) => { result = { kind: 'force_cancelled', event }; },
+    onRecipientTransfer: (event) => { result = { kind: 'recipient_transferred', event }; },
+    onOperatorSet:       (event) => { result = { kind: 'operator_set', event }; },
+    onOperatorRevoke:    (event) => { result = { kind: 'operator_revoked', event }; },
+  });
+  return result;
+}
+
 export interface StreamHistoryOptions {
   /** Cursor from a previous page's `nextCursor`. Omit for the first page. */
   cursor?:      string;
