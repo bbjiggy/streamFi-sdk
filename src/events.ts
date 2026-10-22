@@ -594,6 +594,64 @@ export interface StreamHistoryOptions {
    * the indexer for older history.
    */
   startLedger?: number;
+  /**
+   * Keep only events that match every supplied field. Lets a client that
+   * watches a contract for many streams surface just the rows that mention
+   * the logged-in user or a specific stream, instead of filtering manually
+   * after the page returns (#909). All fields are optional; an omitted field
+   * is not constrained. `streamId` matches the `streamId` field when the
+   * decoded payload carries one, otherwise the entry is dropped (events are
+   * already scoped to one contract by `streamAddress`).
+   */
+  filter?:      StreamEventFilter;
+}
+
+/**
+ * Subset of an event's actors/identity used to narrow a history feed (#909).
+ *
+ * - `recipient` — keep events addressed to this account (withdraw, created,
+ *   recipient-transferred, etc.).
+ * - `sender` — keep events initiated by this account (created, cancel, pause,
+ *   top-up, clawback, …).
+ * - `streamId` — keep events for this specific stream id/contract.
+ */
+export interface StreamEventFilter {
+  recipient?: string;
+  sender?:    string;
+  streamId?:  string;
+}
+
+/** Extract the sender/recipient addresses carried by a decoded history entry. */
+function actorAddressesOf(entry: StreamHistoryEntry): { sender?: string; recipient?: string } {
+  switch (entry.kind) {
+    case 'created':  return { sender: entry.event.sender, recipient: entry.event.recipient };
+    case 'withdraw': return { recipient: entry.event.recipient };
+    case 'top_up':   return { sender: entry.event.sender };
+    case 'pause':    return { sender: entry.event.sender };
+    case 'resume':   return { sender: entry.event.sender };
+    case 'cancel':   return { sender: entry.event.sender };
+    case 'clawback': return { sender: entry.event.sender };
+  }
+}
+
+/**
+ * Returns `true` when `entry` satisfies every field set on `filter`.
+ * An unset filter field is not constrained; an empty filter matches all.
+ */
+export function matchesStreamEventFilter(entry: StreamHistoryEntry, filter: StreamEventFilter): boolean {
+  const { sender, recipient } = actorAddressesOf(entry);
+  if (filter.sender !== undefined && sender !== filter.sender) return false;
+  if (filter.recipient !== undefined && recipient !== filter.recipient) return false;
+  if (filter.streamId !== undefined) {
+    const id = (entry as { streamId?: string }).streamId;
+    if (id !== filter.streamId) return false;
+  }
+  return true;
+}
+
+/** Keep only the history entries that satisfy `filter` (#909). */
+export function filterStreamEvents(entries: StreamHistoryEntry[], filter: StreamEventFilter): StreamHistoryEntry[] {
+  return entries.filter((entry) => matchesStreamEventFilter(entry, filter));
 }
 
 /**
@@ -648,7 +706,7 @@ export async function getStreamHistory(
       // One undecodable event must not hide the rest of the page.
       console.warn('[conduit-sdk] skipping undecodable history event:', err);
     }
-    if (entry) entries.push(entry);
+    if (entry && (!options.filter || matchesStreamEventFilter(entry, options.filter))) entries.push(entry);
   }
 
   // A full page means there may be more. The cursor is a response field the
