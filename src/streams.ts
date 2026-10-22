@@ -29,6 +29,8 @@ import type {
   StreamOperation,
   FeeEstimate,
   ValidationResult,
+  CancelEvent,
+  CliffReachedEvent,
 } from "./types/index.js";
 import type { WalletAdapter } from "./adapters/types.js";
 import type { Signer } from "./signer.js";
@@ -65,7 +67,13 @@ import {
   STREAM_FLAG_CLAWBACK_ENABLED,
   MIN_STREAM_DURATION_SECONDS,
 } from "./constants.js";
-import type { StreamHistoryOptions, StreamHistoryPage } from "./events.js";
+import type {
+  StreamHistoryOptions,
+  StreamHistoryPage,
+  CliffReachedListenerOptions,
+  ReplayEventsOptions,
+  ReplayEventsResult,
+} from "./events.js";
 import { buildBatchTransactions } from "./batch-tx.js";
 import type { BatchTransactionContext } from "./batch-tx.js";
 import { FactoryModule } from "./factory.js";
@@ -1438,6 +1446,39 @@ export class StreamsModule {
   }
 
   /**
+   * Strongly-typed listener for a single named stream notification, decoded
+   * automatically — see {@link onStreamEvent} in `events.ts` for what each
+   * `type` means (`'Cancelled'` is a real on-chain event; `'CliffReached'`
+   * is a client-side vesting-schedule notification, since the contract
+   * emits no cliff event).
+   */
+  async onStreamEvent(
+    streamId: bigint | string,
+    type: 'Cancelled',
+    callback: (event: CancelEvent) => void,
+  ): Promise<Subscription>;
+  async onStreamEvent(
+    streamId: bigint | string,
+    type: 'CliffReached',
+    callback: (event: CliffReachedEvent) => void,
+    options: CliffReachedListenerOptions,
+  ): Promise<Subscription>;
+  async onStreamEvent(
+    streamId: bigint | string,
+    type: 'CliffReached' | 'Cancelled',
+    callback: (event: CancelEvent | CliffReachedEvent) => void,
+    options?: CliffReachedListenerOptions,
+  ): Promise<Subscription> {
+    const addr = await this._resolveAddr(BigInt(streamId));
+    const { onStreamEvent: listenForStreamEvent } = await import("./events.js");
+    if (type === 'Cancelled') {
+      return listenForStreamEvent(this.rpcUrl, addr, 'Cancelled', callback as (event: CancelEvent) => void);
+    }
+    if (!options) throw new Error("onStreamEvent('CliffReached', ...) requires options.cliffTime");
+    return listenForStreamEvent(this.rpcUrl, addr, 'CliffReached', callback as (event: CliffReachedEvent) => void, options);
+  }
+
+  /**
    * Fetch one page of a stream's event history (withdrawals, top-ups, pauses,
    * etc.), oldest first. Pass the returned `nextCursor` back as `cursor` to
    * page forward — see {@link getStreamHistory} for the RPC retention caveat.
@@ -1449,6 +1490,24 @@ export class StreamsModule {
     const addr = await this._resolveAddr(BigInt(streamId));
     const { getStreamHistory } = await import("./events.js");
     return getStreamHistory(this.rpcUrl, addr, options);
+  }
+
+  /**
+   * Backfill a stream's historical events over `[fromLedger, toLedger]`,
+   * dispatching each to `handlers` — see {@link replayEvents} in
+   * `events.ts`. Use this after reconnecting post-outage to recover events
+   * missed while offline, before resuming `subscribeAsync`/`subscribe` for
+   * new events going forward.
+   */
+  async replayEvents(
+    streamId: bigint | string,
+    handlers: StreamEventHandlers,
+    fromLedger: number,
+    options: ReplayEventsOptions = {},
+  ): Promise<ReplayEventsResult> {
+    const addr = await this._resolveAddr(BigInt(streamId));
+    const { replayEvents: replayStreamEvents } = await import("./events.js");
+    return replayStreamEvents(this.rpcUrl, addr, handlers, fromLedger, options);
   }
 
   /** Clear the address cache. Useful for testing or manual memory management. */

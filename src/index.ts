@@ -290,6 +290,9 @@ export type {
   StreamHistoryEntry,
   StreamHistoryPage,
   StreamHistoryOptions,
+  CliffReachedListenerOptions,
+  ReplayEventsOptions,
+  ReplayEventsResult,
 } from "./events.js";
 export type {
   GovernorProposal,
