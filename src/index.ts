@@ -115,12 +115,21 @@ export type {
 } from "./types/index.js";
 export * from "./adapters/index.js";
 export * from "./react/index.js";
-export { FeeEstimator } from "./fee-estimator.js";
+export {
+  FeeEstimator,
+  estimateBatchFootprint,
+  DEFAULT_CPU_INSTRUCTION_LIMIT,
+  DEFAULT_INSTRUCTIONS_PER_BATCH_ITEM,
+  DEFAULT_BATCH_FIXED_OVERHEAD_INSTRUCTIONS,
+  DEFAULT_BATCH_WARN_THRESHOLD,
+} from "./fee-estimator.js";
 export type {
   FeeEstimatorOptions,
   FeeEstimateOptions,
   FeePriority,
   DynamicFeeOptions,
+  BatchFootprintOptions,
+  ResourceEstimate,
 } from "./fee-estimator.js";
 export { coalesceAsync, coalesceInFlight } from "./coalesce-async.js";
 export { WebSocketRelayer } from "./relayer/WebSocketRelayer.js";
