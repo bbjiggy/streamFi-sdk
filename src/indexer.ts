@@ -53,6 +53,19 @@ export interface GraphQLSubscriptionOptions {
   maxReconnectAttempts?: number;
   /** Base delay in ms; actual wait uses capped exponential backoff (max 30s) with jitter. Default 1000. */
   reconnectDelayMs?: number;
+  /**
+   * Heartbeat interval (ms). When positive, the client sends a `ping` frame
+   * every `heartbeatIntervalMs` and expects a `pong` back within
+   * `heartbeatTimeoutMs`; if none arrives the socket is treated as half-open
+   * (NAT timeout, device sleep) and force-reconnected. Defaults to 30_000ms.
+   * Set to `0` to disable the heartbeat.
+   */
+  heartbeatIntervalMs?: number;
+  /**
+   * How long (ms) to wait for a `pong` after sending `ping` before assuming
+   * the connection is dead and triggering a reconnect. Defaults to 5_000ms.
+   */
+  heartbeatTimeoutMs?: number;
 }
 
 export interface IndexerSubscription {
@@ -579,6 +592,20 @@ export class GraphQLIndexer {
       60_000,
       'reconnectDelayMs',
     );
+    const heartbeatIntervalMs = this.parseBoundedInt(
+      options.heartbeatIntervalMs,
+      30_000,
+      0,
+      600_000,
+      'heartbeatIntervalMs',
+    );
+    const heartbeatTimeoutMs = this.parseBoundedInt(
+      options.heartbeatTimeoutMs,
+      5_000,
+      0,
+      600_000,
+      'heartbeatTimeoutMs',
+    );
 
     let unsubscribed = false;
     const subId = `sub_${++this.subCounter}_${Date.now()}`;
@@ -587,6 +614,9 @@ export class GraphQLIndexer {
     let abortController: AbortController | null = null;
     let reconnectAttempts = 0;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+    let heartbeatTimeout: ReturnType<typeof setTimeout> | null = null;
+    let awaitingPong = false;
 
     const clearReconnectTimer = (): void => {
       if (reconnectTimer !== null) {
@@ -595,11 +625,109 @@ export class GraphQLIndexer {
       }
     };
 
+    const clearHeartbeatTimeout = (): void => {
+      if (heartbeatTimeout !== null) {
+        clearTimeout(heartbeatTimeout);
+        heartbeatTimeout = null;
+      }
+    };
+
+    const stopHeartbeat = (): void => {
+      clearHeartbeatTimeout();
+      if (heartbeatInterval !== null) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
+      }
+      awaitingPong = false;
+    };
+
+    /**
+     * Schedule a reconnect using the same capped exponential backoff already
+     * used by {@link socket.onclose}. Extracted so a dead socket whose
+     * `close()` never fires `onclose` (the classic half-open failure) can drive
+     * a reconnect itself after a heartbeat timeout.
+     */
+    const scheduleReconnect = (): void => {
+      if (unsubscribed || this.isDestroyed) return;
+      if (reconnectAttempts >= maxReconnectAttempts) {
+        this.handleError(
+          options.onError,
+          new Error(
+            `GraphQL subscription WebSocket closed on ${this.endpoint} after ${maxReconnectAttempts} reconnect attempts exhausted`,
+          ),
+        );
+        subscription.unsubscribe();
+        return;
+      }
+      reconnectAttempts += 1;
+      const baseDelay = reconnectDelayMs * reconnectAttempts;
+      const cappedDelay = Math.min(baseDelay, 30_000);
+      const jitter = Math.random() * 0.3 * cappedDelay;
+      const delay = cappedDelay + jitter;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (unsubscribed || this.isDestroyed) return;
+        openSocket();
+      }, delay);
+    };
+
+    /**
+     * Drive the keepalive ping/pong heartbeat for one socket. Every
+     * `heartbeatIntervalMs` (when the socket is OPEN and we are not already
+     * awaiting a `pong`) we send a `ping` and arm a `heartbeatTimeoutMs`
+     * timer; if no `pong` comes back in time, the connection is considered
+     * dead and force-reconnected.
+     */
+    const startHeartbeat = (socket: WebSocket): void => {
+      stopHeartbeat();
+      if (!(heartbeatIntervalMs > 0)) return;
+      heartbeatInterval = setInterval(() => {
+        if (unsubscribed || this.isDestroyed) return;
+        if (socket.readyState === 1 /* OPEN */ && !awaitingPong) {
+          try {
+            socket.send(JSON.stringify({ type: 'ping' }));
+            awaitingPong = true;
+            heartbeatTimeout = setTimeout(() => {
+              if (awaitingPong) {
+                handleHeartbeatTimeout();
+              }
+            }, heartbeatTimeoutMs);
+          } catch {
+            // Ignore send errors — the next interval will retry.
+          }
+        }
+      }, heartbeatIntervalMs);
+    };
+
+    /**
+     * No `pong` arrived in time: the socket is half-open. `close()` on such a
+     * socket may never fire `onclose`, so detach the dead socket and drive the
+     * reconnect ourselves rather than waiting on an event that may never come.
+     */
+    const handleHeartbeatTimeout = (): void => {
+      const dead = ws;
+      stopHeartbeat();
+      ws = null;
+      if (dead) {
+        dead.onopen = null;
+        dead.onmessage = null;
+        dead.onerror = null;
+        dead.onclose = null;
+        try {
+          dead.close();
+        } catch {
+          // Socket already closed/closing; nothing to clean up.
+        }
+      }
+      scheduleReconnect();
+    };
+
     const subscription: IndexerSubscription = {
       unsubscribe: () => {
         if (unsubscribed) return;
         unsubscribed = true;
         clearReconnectTimer();
+        stopHeartbeat();
 
         if (ws) {
           try {
@@ -658,6 +786,7 @@ export class GraphQLIndexer {
           return;
         }
         reconnectAttempts = 0;
+        startHeartbeat(socket);
         try {
           socket.send(JSON.stringify({ type: 'connection_init' }));
           queuedSubscribeMessage = JSON.stringify({
@@ -682,6 +811,23 @@ export class GraphQLIndexer {
               : (event.data as unknown);
           if (!raw || typeof raw !== 'object') return;
           const data = raw as GraphQLServerMessage;
+
+          // Heartbeat keepalive (graphql-transport-ws).
+          if (data.type === 'ping') {
+            // Server-initiated keepalive — the client MUST respond with pong.
+            try {
+              socket.send(JSON.stringify({ type: 'pong' }));
+            } catch {
+              // Ignore send errors — the next ping will retry.
+            }
+            return;
+          }
+          if (data.type === 'pong') {
+            // Response to our heartbeat ping: the link is alive.
+            awaitingPong = false;
+            clearHeartbeatTimeout();
+            return;
+          }
 
           if (data.type === 'connection_ack') {
             if (queuedSubscribeMessage !== null) {
@@ -710,31 +856,13 @@ export class GraphQLIndexer {
       };
 
       socket.onclose = () => {
+        stopHeartbeat();
         if (unsubscribed || this.isDestroyed) return;
         this.handleError(
           options.onError,
           new Error(`GraphQL subscription WebSocket closed on ${this.endpoint}`),
         );
-        if (reconnectAttempts >= maxReconnectAttempts) {
-          this.handleError(
-            options.onError,
-            new Error(
-              `GraphQL subscription WebSocket closed on ${this.endpoint} after ${maxReconnectAttempts} reconnect attempts exhausted`,
-            ),
-          );
-          subscription.unsubscribe();
-          return;
-        }
-        reconnectAttempts += 1;
-        const baseDelay = reconnectDelayMs * reconnectAttempts;
-        const cappedDelay = Math.min(baseDelay, 30_000);
-        const jitter = Math.random() * 0.3 * cappedDelay;
-        const delay = cappedDelay + jitter;
-        reconnectTimer = setTimeout(() => {
-          reconnectTimer = null;
-          if (unsubscribed || this.isDestroyed) return;
-          openSocket();
-        }, delay);
+        scheduleReconnect();
       };
     };
 
