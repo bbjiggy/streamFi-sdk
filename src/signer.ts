@@ -108,28 +108,96 @@ export function classifyLedgerError(error: unknown): { type: LedgerErrorType; me
   return normalizeLedgerError(statusCode);
 }
 
-/** A Ledger hardware wallet signer that implements the `Signer` interface. */
+/**
+ * Minimal contract a Ledger device adapter must satisfy, so the signer can be
+ * unit-tested with a mock and wired to `@ledgerhq` (or any transport) in
+ * production without a hard dependency on the hardware libraries (#912).
+ */
+export interface LedgerDevice {
+  /** Resolve the Stellar public key for `path`. */
+  getPublicKey(path: string): Promise<{ publicKey: string }>;
+  /** Sign `txXdr`, returning the reconstructed signed transaction XDR. */
+  signTransaction(path: string, txXdr: string): Promise<{ signature: Uint8Array; signedTxXdr: string }>;
+}
+
+/** A Ledger hardware wallet signer that implements the `Signer` interface (#912). */
 export class LedgerSigner implements Signer {
   private readonly appName: string;
   private readonly path: string;
+  private readonly device: LedgerDevice | undefined;
+  private cachedPublicKey: string | undefined;
 
-  constructor(options?: { appName?: string; path?: string }) {
+  constructor(options?: { appName?: string; path?: string; device?: LedgerDevice; publicKey?: string }) {
     this.appName = options?.appName ?? 'Stellar';
     this.path = options?.path ?? "44'/148'/0'/0/0";
+    this.device = options?.device;
+    this.cachedPublicKey = options?.publicKey;
   }
 
-  async sign(tx: Transaction): Promise<Transaction> {
-    throw new LedgerHardwareError(
-      LedgerErrorType.DeviceDisconnected,
-      'Ledger device signing is not implemented. Ensure the Ledger device is connected and the Stellar app is open.',
-    );
-  }
-
+  /**
+   * Synchronous accessor required by the `Signer` interface. Ledger key
+   * resolution is asynchronous, so the key must be supplied up front (e.g.
+   * derived offline) or fetched first via {@link getPublicKey}; before that,
+   * this throws a {@link LedgerHardwareError}.
+   */
   publicKey(): string {
-    throw new LedgerHardwareError(
-      LedgerErrorType.DeviceDisconnected,
-      'Ledger public key retrieval is not implemented. Ensure the Ledger device is connected.',
-    );
+    if (!this.cachedPublicKey) {
+      throw new LedgerHardwareError(
+        LedgerErrorType.DeviceDisconnected,
+        'Ledger public key not yet resolved — pass publicKey in the constructor or call getPublicKey() first.',
+      );
+    }
+    return this.cachedPublicKey;
+  }
+
+  /** Fetch and cache the device public key for {@link publicKey}. */
+  async getPublicKey(): Promise<string> {
+    if (this.cachedPublicKey) return this.cachedPublicKey;
+    const device = await this.resolveDevice();
+    const { publicKey } = await device.getPublicKey(this.path);
+    this.cachedPublicKey = publicKey;
+    return publicKey;
+  }
+
+  /** Sign `tx` on the device and return the reconstructed transaction. */
+  async sign(tx: Transaction): Promise<Transaction> {
+    const device = await this.resolveDevice();
+    const { signedTxXdr } = await device.signTransaction(this.path, tx.toXDR());
+    const passphrase = (tx as { networkPassphrase?: string }).networkPassphrase ?? '';
+    return new Transaction(signedTxXdr, passphrase);
+  }
+
+  /**
+   * Use the injected device when present; otherwise lazily wire the real
+   * `@ledgerhq` app over a WebUSB transport. The libraries are only imported
+   * here (not at module load) so the SDK builds and tests without them
+   * installed — production callers typically inject their own device.
+   */
+  private async resolveDevice(): Promise<LedgerDevice> {
+    if (this.device) return this.device;
+    try {
+      // The hardware libraries are imported lazily (not at module load) so the
+      // SDK builds and tests without them installed. Production callers typically
+      // inject their own device instead. The specifiers are kept in variables so
+      // bundler/transform import-analysis cannot try to statically resolve these
+      // optional deps (which may be absent from the dependency tree).
+      const ledgerAppModule = '@ledgerhq/hw-app-str';
+      const ledgerTransportModule = '@ledgerhq/hw-transport-webusb';
+      const hwApp: any = await import(ledgerAppModule);
+      const transportMod: any = await import(ledgerTransportModule);
+      const TransportWebUSB = transportMod.default ?? transportMod;
+      const t: unknown = await TransportWebUSB.create();
+      const app = new hwApp.default(t);
+      return {
+        getPublicKey: (path: string) => app.getPublicKey(path),
+        signTransaction: (path: string, txXdr: string) => app.signTransaction(path, txXdr),
+      };
+    } catch {
+      throw new LedgerHardwareError(
+        LedgerErrorType.TransportError,
+        'Ledger device not available: inject a LedgerDevice or install @ledgerhq/hw-app-str and @ledgerhq/hw-transport-webusb.',
+      );
+    }
   }
 }
 
