@@ -32,6 +32,36 @@ import {
   CAIP2_TO_NETWORK,
 } from "./errors.js";
 
+let rpcConnectionPoolingConfigured = false;
+
+/**
+ * Configures `@stellar/stellar-sdk`'s shared Soroban RPC axios instance with
+ * keep-alive HTTP(S) agents (#952), so repeated RPC calls reuse TCP/TLS
+ * connections instead of renegotiating a handshake on every request.
+ *
+ * `SorobanRpc.AxiosClient` is a single instance shared by every
+ * `SorobanRpc.Server` in the process (see `soroban.ts`'s server cache), so
+ * this only needs to run once. A no-op outside Node — e.g. an edge/browser
+ * bundle with no `http`/`https` module — where axios falls back to its
+ * normal per-request behaviour, same as before this change.
+ */
+function configureRpcConnectionPooling(): void {
+  if (rpcConnectionPoolingConfigured) return;
+  rpcConnectionPoolingConfigured = true;
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires -- optional Node-only dependency, guarded by the catch below for non-Node bundles
+    const { Agent: HttpAgent } = require("node:http");
+    // eslint-disable-next-line @typescript-eslint/no-var-requires -- see above
+    const { Agent: HttpsAgent } = require("node:https");
+    const axiosDefaults = SorobanRpc.AxiosClient.defaults;
+    axiosDefaults.httpAgent ??= new HttpAgent({ keepAlive: true, maxSockets: 50 });
+    axiosDefaults.httpsAgent ??= new HttpsAgent({ keepAlive: true, maxSockets: 50 });
+  } catch {
+    // Not running under Node — nothing to configure.
+  }
+}
+
 /**
  * Validate that `wallet`'s network/chain matches the SDK's configured
  * `network`.  Throws `UnsupportedChainError` when:
@@ -229,6 +259,8 @@ export class ConduitClient {
     if (!(SUPPORTED_NETWORKS as readonly string[]).includes(config.network)) {
       throw new UnsupportedChainError(config.network);
     }
+
+    configureRpcConnectionPooling();
 
     const rpcUrl =
       config.rpcUrls?.[0] ?? config.rpcUrl ?? DEFAULT_RPC[config.network];
