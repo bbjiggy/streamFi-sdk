@@ -139,6 +139,18 @@ export function getCircuitState(scope: string): CircuitStatus {
   // Auto-transition from 'open' to 'half-open' after cooldown
   if (entry.state === 'open' && entry.cooldownUntil && Date.now() >= entry.cooldownUntil) {
     entry.state = 'half-open';
+    const status = {
+      state: entry.state,
+      failureCount: entry.failureCount,
+      lastFailureAt: entry.lastFailureAt,
+      lastSuccessAt: entry.lastSuccessAt,
+      cooldownUntil: entry.cooldownUntil,
+    };
+    // `onCircuitStateChange`/`onCircuitChange` must see this transition too —
+    // not just `subscribeCircuitTransitions` — since it's reachable purely by
+    // calling this getter (e.g. a UI polling `state` or `getCircuitState`),
+    // with no intervening recordSuccess/recordFailure call to notify from.
+    notifyListeners(scope, status);
     emitTransition(scope, 'open', 'half-open');
   }
 

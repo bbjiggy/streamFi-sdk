@@ -2,6 +2,18 @@ import { SorobanRpc } from '@stellar/stellar-sdk';
 import type { WebSocketRelayer, WebSocketMessage, MessageHandler } from './WebSocketRelayer.js';
 import { ConduitError, SorobanRpcError, type ConduitContract } from '../errors.js';
 
+/**
+ * Maps a raw Horizon transaction-submission error (`extras.result_codes`,
+ * e.g. `tx_bad_auth`, `op_underfunded`) to a typed SDK error
+ * ({@link BadAuthError}, {@link InsufficientBalanceError}, or
+ * {@link HorizonTransactionError}). Re-exported here — alongside
+ * {@link ErrorMapper}, which does the equivalent job for WebSocket relayer
+ * messages — so both of this module's error-mapping entry points live under
+ * one import (#975).
+ */
+export { mapHorizonError, BadAuthError, HorizonTransactionError } from '../errors.js';
+export type { HorizonResultCodes } from '../errors.js';
+
 export type MappedErrorHandler = (error: Error) => void;
 export type ErrorMessageTypeMap = Record<string, ConduitContract>;
 

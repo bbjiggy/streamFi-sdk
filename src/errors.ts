@@ -1055,6 +1055,176 @@ export class NetworkMismatchError extends Error {
   }
 }
 
+// ── Horizon transaction submission errors (#975) ──────────────────────────────
+
+/**
+ * The `extras.result_codes` block Horizon attaches to a failed
+ * `/transactions` submission: the transaction-level result code, plus one
+ * result code per operation in the envelope (same index as the operation).
+ *
+ * See https://developers.stellar.org/docs/data/horizon/api-reference/errors/result-codes.
+ */
+export interface HorizonResultCodes {
+  /** The transaction-level result code, e.g. `'tx_bad_auth'`, `'tx_failed'`. */
+  transaction?: string;
+  /** Per-operation result codes, e.g. `'op_underfunded'`. Only present when `transaction === 'tx_failed'`. */
+  operations?: string[];
+}
+
+/** Transaction/operation result codes that indicate a missing or invalid signature. */
+const HORIZON_BAD_AUTH_CODES = new Set(['tx_bad_auth', 'tx_bad_auth_extra', 'op_bad_auth']);
+/** Transaction/operation result codes that indicate the source account can't cover the operation. */
+const HORIZON_UNDERFUNDED_CODES = new Set(['tx_insufficient_balance', 'op_underfunded', 'op_low_reserve']);
+
+/**
+ * Thrown by {@link mapHorizonError} when Horizon rejects a transaction for
+ * `tx_bad_auth`, `tx_bad_auth_extra`, or `op_bad_auth` — the submitted
+ * envelope is missing a required signature, carries an unexpected one, or a
+ * signature does not verify against the signer's key.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await horizonServer.submitTransaction(signedTx);
+ * } catch (err) {
+ *   const mapped = mapHorizonError(err);
+ *   if (mapped instanceof BadAuthError) {
+ *     console.error('Missing or invalid signature(s):', mapped.resultCodes);
+ *   }
+ * }
+ * ```
+ */
+export class BadAuthError extends Error {
+  /** The raw Horizon result codes this error was mapped from. */
+  readonly resultCodes: HorizonResultCodes;
+
+  constructor(resultCodes: HorizonResultCodes, detail?: string) {
+    super(detail ?? 'Transaction rejected: missing or invalid signature(s).');
+    this.name = 'BadAuthError';
+    this.resultCodes = resultCodes;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/**
+ * Thrown by {@link mapHorizonError} for a Horizon result code that isn't one
+ * of the dedicated typed errors ({@link BadAuthError},
+ * {@link InsufficientBalanceError}) — e.g. `tx_bad_seq`, `op_no_trust`,
+ * `op_no_destination`. Carries the raw result codes and response body so
+ * callers can still branch on the specific code.
+ *
+ * @example
+ * ```ts
+ * const mapped = mapHorizonError(err);
+ * if (mapped instanceof HorizonTransactionError) {
+ *   console.error(mapped.resultCodes.transaction, mapped.resultCodes.operations);
+ * }
+ * ```
+ */
+export class HorizonTransactionError extends Error {
+  /** The raw Horizon result codes this error was mapped from. */
+  readonly resultCodes: HorizonResultCodes;
+  /** The raw Horizon error response `mapHorizonError` was given. */
+  readonly raw: unknown;
+
+  constructor(resultCodes: HorizonResultCodes, detail?: string, raw?: unknown) {
+    super(
+      detail ??
+        (resultCodes.transaction
+          ? `Horizon rejected the transaction: ${resultCodes.transaction}` +
+            (resultCodes.operations?.length ? ` (${resultCodes.operations.join(', ')})` : '')
+          : 'Horizon rejected the transaction.'),
+    );
+    this.name = 'HorizonTransactionError';
+    this.resultCodes = resultCodes;
+    this.raw = raw;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/**
+ * Extracts `extras.result_codes` from a raw Horizon error response. Accepts
+ * the plain Horizon JSON body (`{ extras: { result_codes } }`), an
+ * axios-style wrapper (`{ response: { data: { extras } } }`), or a fetch-style
+ * wrapper (`{ data: { extras } }`). Returns `null` when no result codes can
+ * be found.
+ *
+ * @internal
+ */
+function extractHorizonResultCodes(json: unknown): HorizonResultCodes | null {
+  if (!json || typeof json !== 'object') return null;
+
+  const obj = json as Record<string, unknown>;
+  const response = obj.response as { data?: unknown } | undefined;
+  const data = obj.data as Record<string, unknown> | undefined;
+  const body = (obj.extras ? obj : response?.data ?? data ?? obj) as Record<string, unknown>;
+
+  const extras = body.extras as Record<string, unknown> | undefined;
+  const resultCodes = extras?.result_codes as Record<string, unknown> | undefined;
+  if (!resultCodes) return null;
+
+  const transaction = typeof resultCodes.transaction === 'string' ? resultCodes.transaction : undefined;
+  const operations = Array.isArray(resultCodes.operations)
+    ? resultCodes.operations.filter((code): code is string => typeof code === 'string')
+    : undefined;
+
+  if (!transaction && !operations?.length) return null;
+  const result: HorizonResultCodes = {};
+  if (transaction !== undefined) result.transaction = transaction;
+  if (operations !== undefined) result.operations = operations;
+  return result;
+}
+
+/**
+ * Converts a raw Horizon transaction-submission error (as thrown by
+ * `Server.submitTransaction()` / `POST /transactions`) into a typed SDK
+ * error, instead of leaving callers to parse `extras.result_codes` JSON by
+ * hand.
+ *
+ * - `tx_bad_auth` / `tx_bad_auth_extra` / `op_bad_auth` → {@link BadAuthError}
+ * - `tx_insufficient_balance` / `op_underfunded` / `op_low_reserve` →
+ *   {@link InsufficientBalanceError} (balances are unknown from the Horizon
+ *   response alone, so both are reported as `0n`; see `currentBalance`/
+ *   `requiredBalance` in that class's docs)
+ * - any other recognised `result_codes` → {@link HorizonTransactionError}
+ * - anything without `extras.result_codes` (network failures, timeouts) is
+ *   returned unchanged (wrapped in `Error` if it isn't one already), so this
+ *   is safe to call in a catch block
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await horizonServer.submitTransaction(signedTx);
+ * } catch (err) {
+ *   throw mapHorizonError(err);
+ * }
+ * ```
+ */
+export function mapHorizonError(json: unknown): Error {
+  const resultCodes = extractHorizonResultCodes(json);
+  if (!resultCodes) {
+    if (json instanceof Error) return json;
+    return new Error(typeof json === 'string' ? json : String(json));
+  }
+
+  const codes = [resultCodes.transaction, ...(resultCodes.operations ?? [])].filter(
+    (code): code is string => typeof code === 'string',
+  );
+
+  if (codes.some((code) => HORIZON_UNDERFUNDED_CODES.has(code))) {
+    return new InsufficientBalanceError(0n, 0n, `Horizon result codes: ${codes.join(', ')}`);
+  }
+  if (codes.some((code) => HORIZON_BAD_AUTH_CODES.has(code))) {
+    return new BadAuthError(resultCodes, `Transaction rejected: missing or invalid signature(s) (${codes.join(', ')}).`);
+  }
+
+  const detail =
+    json && typeof json === 'object' && typeof (json as { detail?: unknown }).detail === 'string'
+      ? (json as { detail: string }).detail
+      : undefined;
+  return new HorizonTransactionError(resultCodes, detail, json);
+}
+
 // ── Type guard ────────────────────────────────────────────────────────────────
 
 /**
@@ -1088,6 +1258,8 @@ export class NetworkMismatchError extends Error {
  * - {@link UserCancelledError}
  * - {@link AlbedoCancelError}
  * - {@link NetworkMismatchError}
+ * - {@link BadAuthError}
+ * - {@link HorizonTransactionError}
  */
 export function isConduitError(value: unknown): value is Error {
   if (!(value instanceof Error)) return false;
@@ -1117,6 +1289,8 @@ export function isConduitError(value: unknown): value is Error {
     'UserCancelledError',
     'AlbedoCancelError',
     'NetworkMismatchError',
+    'BadAuthError',
+    'HorizonTransactionError',
    ].includes(value.name);
 }
 

@@ -30,16 +30,28 @@ export class KeypairWalletAdapter implements WalletAdapter {
    * Note: this wipes the Keypair passed to the constructor, so do not reuse
    * that instance afterwards.
    */
-  destroy(): void {
+  zeroize(): void {
     const keypair = this.keypair;
     if (!keypair) return;
     const internals = keypair as unknown as Record<string, unknown>;
     for (const field of ['_secretKey', '_secretSeed']) {
       const buf = internals[field];
-      if (buf instanceof Uint8Array) buf.fill(0);
+      // `instanceof Uint8Array` can false-negative on a Buffer/TypedArray that
+      // crossed a realm boundary (e.g. a different VM context/iframe); the
+      // whole point of this method is to guarantee the wipe, so use
+      // ArrayBuffer.isView, which checks the internal slot rather than the
+      // prototype chain and holds true across realms.
+      if (ArrayBuffer.isView(buf) && typeof (buf as { fill?: unknown }).fill === 'function') {
+        (buf as unknown as { fill(value: number): void }).fill(0);
+      }
       internals[field] = undefined;
     }
     this.keypair = null;
+  }
+
+  /** Alias for {@link zeroize}, kept for backwards compatibility. */
+  destroy(): void {
+    this.zeroize();
   }
 
   /** True once {@link destroy} has been called. */
