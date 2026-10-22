@@ -14,6 +14,21 @@ export interface DynamicFeeOptions extends FeeEstimateOptions {
   priority?: FeePriority | number;
 }
 
+/**
+ * Recent-ledger inclusion-fee percentiles (stroops per operation) from
+ * Horizon's `/fee_stats` (#960). `p75`/`p95` are what Horizon reports was
+ * actually charged to land in the 75th/95th percentile of recent ledgers —
+ * unlike {@link FeeEstimator.getDynamicFee}, which scales the *modal* fee by
+ * a fixed multiplier, these move with real congestion, including spikes a
+ * fixed multiplier would under- or over-shoot.
+ */
+export interface LedgerFeeStats {
+  /** 75th-percentile fee charged in recent ledgers. Suitable for standard-priority inclusion. */
+  p75: bigint;
+  /** 95th-percentile fee charged in recent ledgers. Suitable for urgent inclusion during congestion. */
+  p95: bigint;
+}
+
 export interface FeeEstimatorOptions {
   /** Horizon base URL queried for `/fee_stats`. Defaults to Stellar mainnet Horizon. */
   horizonUrl?: string;
@@ -68,6 +83,8 @@ export class FeeEstimator {
   private readonly fetchImpl: typeof fetch | undefined;
   private readonly priorityMultipliers: Record<FeePriority, number>;
   private readonly feeMultiplier: number;
+  private ledgerFeeStatsCache: { value: LedgerFeeStats; fetchedAt: number } | null = null;
+  private ledgerFeeStatsPromise: Promise<LedgerFeeStats> | null = null;
 
   /**
    * Creates a new FeeEstimator instance.
@@ -122,6 +139,70 @@ export class FeeEstimator {
     }, { cacheKey: `dynamic:${String(priority)}`, ...rest });
 
     return this.applyBuffer(fee);
+  }
+
+  /**
+   * Fetches the 75th/95th-percentile inclusion fee charged in recent Stellar
+   * ledgers from Horizon's `/fee_stats` (#960), as an alternative to
+   * {@link getDynamicFee}'s fixed-multiplier-on-modal-fee approach.
+   *
+   * Cached for `cacheTtlMs` (3s, shared with `estimateFee`'s default
+   * caching window) and request-deduplicated the same way `estimateFee`
+   * is — concurrent callers during a cold cache share one Horizon request
+   * instead of issuing one each. On a network error, falls back to the
+   * last successfully fetched stats (via `onError`) and only throws if none
+   * exist yet.
+   *
+   * The configured {@link FeeEstimatorOptions.feeMultiplier} buffer is
+   * applied to both percentiles, consistent with `getDynamicFee`.
+   *
+   * @example
+   * const { p95 } = await estimator.getLedgerFeeStats();
+   */
+  async getLedgerFeeStats(options: FeeEstimateOptions = {}): Promise<LedgerFeeStats> {
+    const cached = this.ledgerFeeStatsCache;
+    if (cached && Date.now() - cached.fetchedAt < this.cacheTtlMs) {
+      return cached.value;
+    }
+    if (this.ledgerFeeStatsPromise) {
+      return this.ledgerFeeStatsPromise;
+    }
+
+    const promise = (async (): Promise<LedgerFeeStats> => {
+      try {
+        const doFetch = this.fetchImpl ?? globalThis.fetch;
+        const res = await doFetch(`${this.horizonUrl}/fee_stats`);
+        if (!res.ok) throw new Error(`Horizon fee_stats request failed: ${res.status}`);
+        const stats = (await res.json()) as {
+          last_ledger_base_fee?: string;
+          fee_charged?: { mode?: string; p75?: string; p95?: string };
+        };
+        // Horizon omits percentile fields when recent ledgers are empty — fall
+        // back to the modal/last-ledger-base fee so a quiet network still
+        // yields a usable (if conservative) estimate rather than an error.
+        const fallback = stats.fee_charged?.mode ?? stats.last_ledger_base_fee;
+        const p75raw = stats.fee_charged?.p75 ?? fallback;
+        const p95raw = stats.fee_charged?.p95 ?? fallback;
+        if (p75raw === undefined || !/^\d+$/.test(p75raw) || p95raw === undefined || !/^\d+$/.test(p95raw)) {
+          throw new Error('Invalid network fee response');
+        }
+        const value: LedgerFeeStats = {
+          p75: this.applyBuffer(BigInt(p75raw)),
+          p95: this.applyBuffer(BigInt(p95raw)),
+        };
+        this.ledgerFeeStatsCache = { value, fetchedAt: Date.now() };
+        return value;
+      } catch (error) {
+        const normalizedError = error instanceof Error ? error : new Error(String(error));
+        options.onError?.(normalizedError);
+        if (this.ledgerFeeStatsCache) return this.ledgerFeeStatsCache.value;
+        throw normalizedError;
+      } finally {
+        this.ledgerFeeStatsPromise = null;
+      }
+    })();
+    this.ledgerFeeStatsPromise = promise;
+    return promise;
   }
 
   /**
