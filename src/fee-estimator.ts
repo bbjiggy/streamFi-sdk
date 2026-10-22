@@ -1,5 +1,66 @@
+import { SorobanRpc, Transaction } from '@stellar/stellar-sdk';
+import { createRpcServer } from './soroban.js';
+
 /** Inclusion-fee priority tier used by {@link FeeEstimator.getDynamicFee}. */
 export type FeePriority = 'low' | 'standard' | 'urgent';
+
+/**
+ * Resource-fee components reported by a Soroban simulation (#906).
+ *
+ * Unlike the inclusion fee (see {@link FeeEstimator.getDynamicFee}, which
+ * comes from Horizon's `/fee_stats`), these come from `simulateTransaction`
+ * and represent what the network will actually charge to run the invocation:
+ *
+ * - `resourceFee` — total resource fee in stroops (CPU + RAM + storage
+ *   footprint), as `SimulateTransactionResponse.minResourceFee`.
+ * - `cpuInstructions` — instruction budget the invocation is scheduled for.
+ * - `readBytes` / `writeBytes` — storage footprint (read/write) bytes.
+ */
+export interface SorobanResourceFees {
+  resourceFee:     bigint;
+  cpuInstructions: bigint;
+  readBytes:       bigint;
+  writeBytes:      bigint;
+}
+
+/**
+ * Pull the resource-fee components out of a `simulateTransaction` result.
+ *
+ * `minResourceFee` is the network's single number for the whole invocation;
+ * the per-host-function `transactionData.resources()` breaks that down into
+ * the CPU instruction budget and the storage read/write footprint so a caller
+ * can see *why* a fee is high (a big read footprint, say) and trim it. Pure
+ * and side-effect free, so it can be unit-tested without a live RPC.
+ *
+ * @param simulation - The `SimulateTransactionResponse` to read.
+ * @returns Aggregated resource-fee components; `0n` for any field the
+ *   simulation did not populate (e.g. an error simulation with no results).
+ */
+export function extractResourceFees(
+  simulation: SorobanRpc.Api.SimulateTransactionResponse,
+): SorobanResourceFees {
+  // The installed SDK's `SimulateTransactionResponse` type lags the live RPC
+  // shape, which always carries `minResourceFee` and `results[].transactionData`;
+  // read them through a loose cast (same defensiveness the SDK uses elsewhere
+  // for fields its own types omit).
+  const sim = simulation as unknown as {
+    minResourceFee?: string;
+    results?: Array<{ transactionData?: { resources?: () => { instructions?: bigint; diskReadBytes?: bigint; writeBytes?: bigint } } }>;
+  };
+  const resourceFee = sim.minResourceFee ? BigInt(sim.minResourceFee) : 0n;
+  let cpuInstructions = 0n;
+  let readBytes = 0n;
+  let writeBytes = 0n;
+  for (const result of sim.results ?? []) {
+    const resources = result.transactionData?.resources?.();
+    if (resources) {
+      cpuInstructions += resources.instructions ?? 0n;
+      readBytes += resources.diskReadBytes ?? 0n;
+      writeBytes += resources.writeBytes ?? 0n;
+    }
+  }
+  return { resourceFee, cpuInstructions, readBytes, writeBytes };
+}
 
 const DEFAULT_PRIORITY_MULTIPLIERS: Record<FeePriority, number> = {
   low: 1,
@@ -425,5 +486,41 @@ export class FeeEstimator {
 
   get isStale(): boolean {
     return this.lastErrorValue !== null;
+  }
+
+  /**
+   * Estimate the Soroban resource fee for a transaction by simulating it.
+   *
+   * Inclusion fee (`getDynamicFee`) tells you what the network charges to
+   * *include* the transaction; this tells you what the invocation itself
+   * costs in CPU/RAM/footprint — the component that spikes during fee surges
+   * and causes "insufficient fee" rejections (#906). The breakdown comes from
+   * {@link extractResourceFees}.
+   *
+   * @param transaction - The (unsigned) transaction to simulate.
+   * @param options.simulate - Inject a simulator for testing; defaults to
+   *   `sorobanServer.simulateTransaction(tx)` against `options.rpcUrl`.
+   * @param options.rpcUrl - RPC endpoint used when no `simulate` is supplied.
+   * @example
+   * ```ts
+   * const fees = await estimator.estimateResourceFees(tx, { rpcUrl });
+   * console.log(`resource fee: ${fees.resourceFee} stroops, CPU: ${fees.cpuInstructions}`);
+   * ```
+   */
+  async estimateResourceFees(
+    transaction: Transaction,
+    options: {
+      rpcUrl?: string;
+      simulate?: (tx: Transaction) => Promise<SorobanRpc.Api.SimulateTransactionResponse>;
+    } = {},
+  ): Promise<SorobanResourceFees> {
+    const simulate = options.simulate ?? (async (tx) => {
+      if (!options.rpcUrl) {
+        throw new Error('estimateResourceFees requires rpcUrl or a simulate callback');
+      }
+      return createRpcServer(options.rpcUrl).simulateTransaction(tx);
+    });
+    const simulation = await simulate(transaction);
+    return extractResourceFees(simulation);
   }
 }
