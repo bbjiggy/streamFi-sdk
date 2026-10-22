@@ -13,6 +13,7 @@ import {
   Contract,
   Address,
   Asset,
+  Account,
   Memo,
   xdr,
   BASE_FEE,
@@ -25,6 +26,7 @@ import {
   InsufficientBalanceError,
   ConfirmationTimeoutError,
   CircuitOpenError,
+  RpcServiceUnavailableError,
 } from "./errors.js";
 import { withRetry } from "./with-retry.js";
 import { coalesceAsync } from "./coalesce-async.js";
@@ -198,6 +200,21 @@ export const DEFAULT_RPC: Record<Network, string> = {
   mainnet: "https://soroban-mainnet.stellar.org",
   testnet: "https://soroban-testnet.stellar.org",
   local: "http://localhost:8000/soroban/rpc",
+};
+
+/**
+ * Default Horizon endpoints, used as a fallback source for an account's
+ * sequence number when the Soroban RPC endpoint itself is unreachable (see
+ * {@link getAccountWithFallback} and #953). Horizon is a separate service
+ * from Soroban RPC — it cannot simulate or submit Soroban contract
+ * invocations — but it reads account state from the same ledger, so it can
+ * stand in for the one RPC call every contract invocation needs just to
+ * learn the caller's current sequence number.
+ */
+export const DEFAULT_HORIZON: Record<Network, string> = {
+  mainnet: "https://horizon.stellar.org",
+  testnet: "https://horizon-testnet.stellar.org",
+  local: "http://localhost:8000",
 };
 
 export const NETWORK_PASSPHRASE: Record<Network, string> = {
@@ -441,6 +458,90 @@ export function resolveFee(config: {
 }
 
 /**
+ * Fetches an account's current sequence number directly from Horizon's
+ * REST API (`GET /accounts/{id}`), for use as a fallback when the Soroban
+ * RPC endpoint's `getAccount` is unreachable. Horizon and Soroban RPC read
+ * account state from the same ledger, so the sequence number is the same
+ * either way — this is only ever used as a stand-in for a *down* RPC
+ * endpoint, not a source of different data.
+ */
+async function fetchAccountFromHorizon(
+  horizonUrl: string,
+  accountId: string,
+  customFetch?: typeof fetch,
+): Promise<Account> {
+  const doFetch = customFetch ?? fetch;
+  const base = horizonUrl.replace(/\/+$/, "");
+  let res: Response;
+  try {
+    res = await doFetch(`${base}/accounts/${accountId}`);
+  } catch (cause) {
+    throw new StreamFiNetworkError(
+      `Horizon fallback request failed for account ${accountId}`,
+      cause,
+    );
+  }
+  if (!res.ok) {
+    throw new StreamFiNetworkError(
+      `Horizon fallback failed to fetch account ${accountId}: HTTP ${res.status}`,
+    );
+  }
+  const data = (await res.json()) as { sequence?: string };
+  if (!data.sequence) {
+    throw new StreamFiNetworkError(
+      `Horizon fallback returned no sequence number for account ${accountId}`,
+    );
+  }
+  return new Account(accountId, data.sequence);
+}
+
+/**
+ * Resolve `caller`'s current account (sequence number), preferring the
+ * Soroban RPC endpoint and automatically failing over to Horizon when the
+ * RPC endpoint itself is unreachable — a {@link StreamFiNetworkError}
+ * (transport-level failure), {@link RpcServiceUnavailableError} (HTTP 503),
+ * or {@link CircuitOpenError} (the SDK's own circuit breaker has already
+ * given up on this endpoint). See #953.
+ *
+ * Any other error (e.g. "account not found" for a real but unfunded
+ * address) is rethrown as-is without touching Horizon — those indicate the
+ * RPC endpoint is reachable and answered correctly, so failing over would
+ * just mask the real error with a second, unrelated lookup.
+ *
+ * No fallback is attempted when `horizonUrl` is not provided; the original
+ * error propagates unchanged.
+ */
+export async function getAccountWithFallback(
+  server: SorobanRpc.Server,
+  caller: string,
+  horizonUrl?: string,
+  customFetch?: typeof fetch,
+): Promise<Account> {
+  try {
+    return await catchNetworkError("getAccount", server.getAccount(caller));
+  } catch (err) {
+    const endpointUnreachable =
+      err instanceof StreamFiNetworkError ||
+      err instanceof RpcServiceUnavailableError ||
+      err instanceof CircuitOpenError;
+    if (!endpointUnreachable || !horizonUrl) throw err;
+    return fetchAccountFromHorizon(horizonUrl, caller, customFetch);
+  }
+}
+
+/** Options accepted by {@link buildContractCallTx} beyond the core call parameters. */
+export interface BuildContractCallTxOptions {
+  /**
+   * Horizon endpoint to fall back to for the account/sequence-number lookup
+   * when the Soroban RPC endpoint is unreachable. No fallback is attempted
+   * when omitted. See {@link getAccountWithFallback} and #953.
+   */
+  horizonUrl?: string;
+  /** Custom `fetch` used for the Horizon fallback request. Defaults to the global `fetch`. */
+  customFetch?: typeof fetch;
+}
+
+/**
  * Build a contract-call transaction for simulate or submit.
  *
  * Fetches the caller's account from the RPC to get the current sequence
@@ -448,6 +549,8 @@ export function resolveFee(config: {
  *
  * @param fee - Inclusion fee in stroops. Defaults to `BASE_FEE`; pass the
  * result of {@link resolveFee} to honour `ConduitConfig.fee`/`feeMultiplier`.
+ * @param options - See {@link BuildContractCallTxOptions}; set `horizonUrl`
+ * to enable automatic failover to Horizon when the RPC endpoint is down.
  */
 export async function buildContractCallTx(
   rpcUrl: string,
@@ -458,12 +561,18 @@ export async function buildContractCallTx(
   args: xdr.ScVal[],
   fee: string = BASE_FEE,
   memo?: Memo,
+  options: BuildContractCallTxOptions = {},
 ): Promise<ReturnType<TransactionBuilder["build"]>> {
   const server = createRpcServer(rpcUrl);
 
   let account;
   try {
-    account = await catchNetworkError("getAccount", server.getAccount(caller));
+    account = await getAccountWithFallback(
+      server,
+      caller,
+      options.horizonUrl,
+      options.customFetch,
+    );
   } catch (err) {
     throw RateLimitError.fromRpcError(err) ?? err;
   }

@@ -97,6 +97,16 @@ export interface ConduitConfig {
   /** Override default Soroban RPC URL */
   rpcUrl?: string;
   /**
+   * Horizon endpoint to automatically fail over to for the account/sequence
+   * lookup when the Soroban RPC endpoint itself is unreachable (network
+   * error, HTTP 503, or an open circuit) — see #953. Defaults to the
+   * official Horizon endpoint for `network`. Horizon cannot simulate or
+   * submit Soroban contract calls, so this only covers the `getAccount`
+   * step every contract invocation needs; it does not provide failover for
+   * simulation or submission.
+   */
+  horizonUrl?: string;
+  /**
    * Array of Soroban RPC URLs for fallback failover. When provided, takes
    * precedence over `rpcUrl`. Endpoints are tried in order, with automatic
    * failover to the next URL after `rpcUrlFailureThresholdConsecutive`

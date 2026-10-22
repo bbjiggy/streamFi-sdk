@@ -1,5 +1,15 @@
 export { ConduitClient } from "./client.js";
-export { StreamsModule, validateStreamParameters } from "./streams.js";
+export {
+  StreamsModule,
+  validateStreamParameters,
+  calculateVestedPercentage,
+  isStreamCancellableByAccount,
+  simulateWithdraw,
+} from "./streams.js";
+export type {
+  SimulatedWithdraw,
+  SimulateWithdrawOptions,
+} from "./streams.js";
 export { StreamBuilder, ConduitBatcher } from "./builder.js";
 export type { SimulateOptions, SimulationResult } from "./builder.js";
 export type {
@@ -178,6 +188,11 @@ export { TokenModule } from "./token.js";
 
 // RPC server lifecycle
 export { getServer, clearServerCache, resolveFee } from "./soroban.js";
+export {
+  DEFAULT_HORIZON,
+  getAccountWithFallback,
+} from "./soroban.js";
+export type { BuildContractCallTxOptions } from "./soroban.js";
 export { waitForConfirmation } from "./soroban.js";
 export type {
   WaitForConfirmationOptions,

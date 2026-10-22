@@ -14,6 +14,7 @@ import {
   scValToU32,
   NETWORK_PASSPHRASE,
   DEFAULT_RPC,
+  DEFAULT_HORIZON,
 } from './soroban.js';
 import { SUPPORTED_NETWORKS, UnsupportedChainError } from './errors.js';
 import { mapWithConcurrency, DEFAULT_LIST_CONCURRENCY } from './map-with-concurrency.js';
@@ -45,6 +46,7 @@ export interface StreamAddressesOptions {
 export class FactoryModule {
   private readonly rpcUrl:      string;
   private readonly passphrase:  string;
+  private readonly horizonUrl:  string;
   private readonly factoryId:   string;
 
   /**
@@ -81,6 +83,7 @@ export class FactoryModule {
     }
     this.rpcUrl     = config.rpcUrl     ?? DEFAULT_RPC[config.network];
     this.passphrase = NETWORK_PASSPHRASE[config.network];
+    this.horizonUrl = config.horizonUrl ?? DEFAULT_HORIZON[config.network];
     // There is no known default DripFactory deployment for any network —
     // shipping a placeholder string here means callers who forget to set
     // this fail deep inside @stellar/stellar-sdk with a confusing StrKey
@@ -108,6 +111,18 @@ export class FactoryModule {
   setWallet(wallet: WalletAdapter): void {
     this.activeWallet = wallet;
     this._cachedCallerAddr = null;
+  }
+
+  /**
+   * Options forwarded to every {@link buildContractCallTx} call so the
+   * `getAccount` step can fail over to Horizon when the Soroban RPC
+   * endpoint is unreachable (see #953).
+   */
+  private _txOptions(): { horizonUrl: string; customFetch?: typeof fetch } {
+    return {
+      horizonUrl: this.horizonUrl,
+      ...(this.config.customFetch ? { customFetch: this.config.customFetch } : {}),
+    };
   }
 
   /**
@@ -172,6 +187,7 @@ export class FactoryModule {
     const tx  = await buildContractCallTx(
       this.rpcUrl, this.passphrase, caller,
       this.factoryId, 'stream_count', [],
+      undefined, undefined, this._txOptions(),
     );
     const val = await simulateReadOnly(this.rpcUrl, this.passphrase, tx);
     return scValToU64(val);
@@ -186,6 +202,7 @@ export class FactoryModule {
       this.rpcUrl, this.passphrase, caller,
       this.factoryId, 'stream_count_by_sender',
       [new Address(address).toScVal()],
+      undefined, undefined, this._txOptions(),
     );
     const val = await simulateReadOnly(this.rpcUrl, this.passphrase, tx);
     return scValToU64(val);
@@ -200,6 +217,7 @@ export class FactoryModule {
       this.rpcUrl, this.passphrase, caller,
       this.factoryId, 'stream_count_by_recipient',
       [new Address(address).toScVal()],
+      undefined, undefined, this._txOptions(),
     );
     const val = await simulateReadOnly(this.rpcUrl, this.passphrase, tx);
     return scValToU64(val);
@@ -228,6 +246,7 @@ export class FactoryModule {
       this.rpcUrl, this.passphrase, caller,
       this.factoryId, 'stream_address',
       [nativeToScVal(id, { type: 'u64' })],
+      undefined, undefined, this._txOptions(),
     );
     const val = await simulateReadOnly(this.rpcUrl, this.passphrase, tx);
 
@@ -364,6 +383,7 @@ export class FactoryModule {
         nativeToScVal(clampOffset(offset), { type: 'u32' }),
         nativeToScVal(clampedLimit, { type: 'u32' }),
       ],
+      undefined, undefined, this._txOptions(),
     );
     const val = await simulateReadOnly(this.rpcUrl, this.passphrase, tx);
     const ids = this.parseU64Vec(val);
@@ -398,6 +418,7 @@ export class FactoryModule {
         nativeToScVal(clampOffset(offset), { type: 'u32' }),
         nativeToScVal(clampedLimit, { type: 'u32' }),
       ],
+      undefined, undefined, this._txOptions(),
     );
     const val = await simulateReadOnly(this.rpcUrl, this.passphrase, tx);
     const ids = this.parseU64Vec(val);
@@ -413,6 +434,7 @@ export class FactoryModule {
     const tx  = await buildContractCallTx(
       this.rpcUrl, this.passphrase, caller,
       this.factoryId, 'protocol_fee_bps', [],
+      undefined, undefined, this._txOptions(),
     );
     const val = await simulateReadOnly(this.rpcUrl, this.passphrase, tx);
     return scValToU32(val);
@@ -431,6 +453,7 @@ export class FactoryModule {
     const tx  = await buildContractCallTx(
       this.rpcUrl, this.passphrase, caller,
       this.factoryId, 'paused', [],
+      undefined, undefined, this._txOptions(),
     );
     const val = await simulateReadOnly(this.rpcUrl, this.passphrase, tx);
     // Contract returns a boolean (scvBool)

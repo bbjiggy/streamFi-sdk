@@ -52,6 +52,7 @@ import {
   estimateRequiredFee,
   CREATE_RESOURCE_FEE_ESTIMATE,
   DEFAULT_RPC,
+  DEFAULT_HORIZON,
   NETWORK_PASSPHRASE,
   DEFAULT_CONFIRMATION_MAX_ATTEMPTS,
   DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
@@ -354,9 +355,159 @@ export function calculateWithdrawableAmount(
   return available > 0n ? available : 0n;
 }
 
+/**
+ * Pure helper to calculate how much of a bounded stream's duration has
+ * elapsed, as a ratio from 0.0 (not started) to 1.0 (fully vested).
+ *
+ * Only defined for bounded streams (`endTime > startTime`): an open-ended
+ * stream (`endTime === 0`) has no total duration to measure progress
+ * against, so this returns `0`. Because the contract streams at a constant
+ * `ratePerSecond` for the whole bounded duration, the fraction of *time*
+ * elapsed equals the fraction of the *deposit* vested — this does not need
+ * `ratePerSecond` or a total deposit amount at all.
+ *
+ * Mirrors {@link calculateWithdrawableAmount}'s pause/end-time handling:
+ * accrual freezes at `pausedAt` while paused, and is clamped to `endTime`.
+ * A cancelled stream returns `0` (no cancellation timestamp is retained on
+ * `StreamInfo` to compute a meaningful ratio as-of cancellation).
+ *
+ * @param stream - The stream snapshot (StreamInfo)
+ * @param currentTimestamp - Unix timestamp (seconds) for the current time; defaults to now
+ * @returns The fraction of the stream's duration vested, clamped to [0, 1]
+ */
+export function calculateVestedPercentage(
+  stream: StreamInfo,
+  currentTimestamp: number = Math.floor(Date.now() / 1000),
+): number {
+  if (stream.cancelled) return 0;
+
+  const totalSeconds = stream.endTime - stream.startTime;
+  if (stream.endTime <= 0 || totalSeconds <= 0) return 0;
+
+  const endClamped =
+    currentTimestamp > stream.endTime ? stream.endTime : currentTimestamp;
+  const effectiveNow =
+    stream.paused && stream.pausedAt < endClamped
+      ? stream.pausedAt
+      : endClamped;
+
+  if (effectiveNow <= stream.startTime) return 0;
+
+  const ratio = (effectiveNow - stream.startTime) / totalSeconds;
+  return ratio > 1 ? 1 : ratio;
+}
+
+/**
+ * Pure helper to check whether `walletAddress` can cancel `stream` right
+ * now, for conditionally rendering/disabling a "Cancel Stream" button
+ * without an RPC round-trip.
+ *
+ * - Returns `false` for an already-cancelled stream (nothing left to
+ *   cancel) and for an empty/invalid `walletAddress`.
+ * - The sender can always call {@link StreamsModule.cancel} on an active
+ *   stream, so this returns `true` for `walletAddress === stream.sender`.
+ * - The recipient can only call {@link StreamsModule.forceCancel} once the
+ *   stream has been paused for at least `options.pauseThresholdSeconds` —
+ *   a contract-configured value this SDK does not fetch on its own (it is
+ *   not part of `StreamInfo` or `GovernorConfig`). Pass it explicitly (e.g.
+ *   from your own governance/config source) to evaluate that rule; without
+ *   it, this conservatively returns `false` for the recipient rather than
+ *   guessing.
+ * - Returns `false` for every other address (no operator address is
+ *   exposed on `StreamInfo` to check against either).
+ *
+ * @param stream - The stream snapshot (StreamInfo)
+ * @param walletAddress - The caller's Stellar address to check permissions for
+ * @param options.pauseThresholdSeconds - Seconds a stream must stay paused before the recipient may force-cancel it
+ * @param options.currentTimestamp - Unix timestamp (seconds) for the current time; defaults to now
+ */
+export function isStreamCancellableByAccount(
+  stream: StreamInfo,
+  walletAddress: string,
+  options: {
+    pauseThresholdSeconds?: number;
+    currentTimestamp?: number;
+  } = {},
+): boolean {
+  if (!walletAddress || typeof walletAddress !== "string") return false;
+  if (stream.cancelled) return false;
+
+  if (walletAddress === stream.sender) return true;
+
+  if (walletAddress === stream.recipient) {
+    if (!stream.paused || options.pauseThresholdSeconds === undefined) {
+      return false;
+    }
+    const now = options.currentTimestamp ?? Math.floor(Date.now() / 1000);
+    return now - stream.pausedAt >= options.pauseThresholdSeconds;
+  }
+
+  return false;
+}
+
+/** Result of {@link simulateWithdraw}'s offline withdrawal preview. */
+export interface SimulatedWithdraw {
+  /** The amount that would actually be withdrawn (clamped to `withdrawable`). */
+  withdrawAmount: bigint;
+  /** The stream's total withdrawable balance at `currentTimestamp`, before this withdrawal. */
+  withdrawable: bigint;
+  /** Stream balance remaining withdrawable immediately after this withdrawal. */
+  remainingWithdrawable: bigint;
+  /** Assumed network inclusion fee for the withdraw transaction, in stroops. */
+  estimatedFee: bigint;
+  /** Whether the requested amount exceeded `withdrawable` and was clamped down to it. */
+  exceedsAvailable: boolean;
+}
+
+/** Options for {@link simulateWithdraw}. */
+export interface SimulateWithdrawOptions {
+  /** Amount to preview withdrawing, in stroops. Defaults to the full withdrawable balance. */
+  amount?: bigint;
+  /** Unix timestamp (seconds) to simulate as "now". Defaults to the current time. */
+  currentTimestamp?: number;
+  /** Inclusion fee to assume, in stroops. Defaults to `BASE_FEE` (100 stroops), the network minimum. */
+  fee?: string;
+}
+
+/**
+ * Pure, offline preview of a {@link StreamsModule.withdraw} call: predicts
+ * the withdrawable balance and the amount that would actually be withdrawn,
+ * without any RPC round-trip. Mirrors the client-side clamping `withdraw()`
+ * itself performs — requesting more than `withdrawable` does not throw here
+ * (unlike `withdraw()`), it is reported via `exceedsAvailable` so a UI can
+ * preview the real outcome instead of an error.
+ *
+ * The fee returned is a static assumption (`options.fee` or `BASE_FEE`), not
+ * a live network estimate — getting a congestion-aware estimate requires an
+ * RPC/Horizon round-trip (see {@link StreamsModule.estimateFee}), which this
+ * function deliberately avoids so it can run instantly in a UI pre-check.
+ *
+ * @param stream - The stream snapshot (StreamInfo)
+ * @param options - See {@link SimulateWithdrawOptions}
+ */
+export function simulateWithdraw(
+  stream: StreamInfo,
+  options: SimulateWithdrawOptions = {},
+): SimulatedWithdraw {
+  const currentTimestamp = options.currentTimestamp ?? Math.floor(Date.now() / 1000);
+  const withdrawable = calculateWithdrawableAmount(stream, currentTimestamp);
+  const requested = options.amount ?? withdrawable;
+  const exceedsAvailable = requested > withdrawable;
+  const withdrawAmount = exceedsAvailable ? withdrawable : requested;
+
+  return {
+    withdrawAmount,
+    withdrawable,
+    remainingWithdrawable: withdrawable - withdrawAmount,
+    estimatedFee: BigInt(options.fee ?? BASE_FEE),
+    exceedsAvailable,
+  };
+}
+
 export class StreamsModule {
   private readonly rpcUrl: string;
   private readonly passphrase: string;
+  private readonly horizonUrl: string;
   private readonly _factory: FactoryModule;
   private readonly feeEstimator: FeeEstimator;
   private readonly feeEstimateCache = new Map<
@@ -391,6 +542,7 @@ export class StreamsModule {
   constructor(private readonly config: ConduitConfig) {
     this.rpcUrl = config.rpcUrl ?? DEFAULT_RPC[config.network];
     this.passphrase = NETWORK_PASSPHRASE[config.network];
+    this.horizonUrl = config.horizonUrl ?? DEFAULT_HORIZON[config.network];
     this._factory = new FactoryModule(config);
     this._fee = resolveFee(config);
     this.feeEstimator = new FeeEstimator(
@@ -416,6 +568,18 @@ export class StreamsModule {
 
   private _signer(): Signer | null {
     return this.config.signer ?? null;
+  }
+
+  /**
+   * Options forwarded to every {@link buildContractCallTx} call so the
+   * `getAccount` step can fail over to Horizon when the Soroban RPC
+   * endpoint is unreachable (see #953).
+   */
+  private _txOptions(): { horizonUrl: string; customFetch?: typeof fetch } {
+    return {
+      horizonUrl: this.horizonUrl,
+      ...(this.config.customFetch ? { customFetch: this.config.customFetch } : {}),
+    };
   }
 
   /**
@@ -532,6 +696,8 @@ export class StreamsModule {
       "create_stream",
       args,
       this._fee,
+      undefined,
+      this._txOptions(),
     );
     const server = this._server();
     const sim = await catchNetworkError(
@@ -605,6 +771,9 @@ export class StreamsModule {
       addr,
       "info",
       [],
+      undefined,
+      undefined,
+      this._txOptions(),
     );
     const val = await this._simulateTx(tx, signal, id);
     return parseStreamInfo(id, addr, val);
@@ -661,6 +830,9 @@ export class StreamsModule {
       addr,
       "withdrawable",
       [],
+      undefined,
+      undefined,
+      this._txOptions(),
     );
     const val = await this._simulateTx(tx, signal, id);
     return scValToI128(val);
@@ -689,6 +861,9 @@ export class StreamsModule {
       addr,
       "streamed_total",
       [],
+      undefined,
+      undefined,
+      this._txOptions(),
     );
     const val = await this._simulateTx(tx, signal, id);
     return scValToI128(val);
@@ -1076,6 +1251,8 @@ export class StreamsModule {
       "clawback",
       [],
       this._fee,
+      undefined,
+      this._txOptions(),
     );
     const server = this._server();
     const sim = await catchNetworkError(
@@ -1170,6 +1347,9 @@ export class StreamsModule {
           this.config.factoryAddress ?? "",
           "create_stream",
           args,
+          undefined,
+          undefined,
+          this._txOptions(),
         );
         break;
       }
@@ -1184,6 +1364,9 @@ export class StreamsModule {
           addr,
           "withdraw",
           [nativeToScVal(qty, { type: "i128" })],
+          undefined,
+          undefined,
+          this._txOptions(),
         );
         break;
       }
@@ -1197,6 +1380,9 @@ export class StreamsModule {
           addr,
           "cancel",
           [],
+          undefined,
+          undefined,
+          this._txOptions(),
         );
         break;
       }
@@ -1210,6 +1396,9 @@ export class StreamsModule {
           addr,
           "pause",
           [],
+          undefined,
+          undefined,
+          this._txOptions(),
         );
         break;
       }
@@ -1223,6 +1412,9 @@ export class StreamsModule {
           addr,
           "resume",
           [],
+          undefined,
+          undefined,
+          this._txOptions(),
         );
         break;
       }
@@ -1237,6 +1429,9 @@ export class StreamsModule {
           addr,
           "top_up",
           [nativeToScVal(qty, { type: "i128" })],
+          undefined,
+          undefined,
+          this._txOptions(),
         );
         break;
       }
@@ -1250,6 +1445,9 @@ export class StreamsModule {
           addr,
           "clawback",
           [],
+          undefined,
+          undefined,
+          this._txOptions(),
         );
         break;
       }
@@ -1261,6 +1459,9 @@ export class StreamsModule {
           this.config.factoryAddress ?? "",
           "create_stream",
           [],
+          undefined,
+          undefined,
+          this._txOptions(),
         );
         break;
       }
@@ -1724,6 +1925,8 @@ export class StreamsModule {
       method,
       args,
       this._fee,
+      undefined,
+      this._txOptions(),
     );
     const server = this._server();
     const sim = await catchNetworkError(
