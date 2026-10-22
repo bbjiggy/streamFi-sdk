@@ -35,6 +35,23 @@ export interface MockIndexerOptions {
   subscriptions?: MockSubscriptionMap;
   /** When true, unknown queries throw instead of returning undefined. Default false. */
   strict?: boolean;
+  /**
+   * Artificial delay (ms) applied to every `query()` resolution and every
+   * `subscribe()` emission, simulating network latency (#911). Default 0.
+   */
+  latencyMs?: number;
+  /**
+   * Probability in `[0, 1)` that any given call/emission fails, simulating
+   * intermittent RPC connection drops so clients can exercise their
+   * error-handling UI (#911). Default 0. Failures throw from `query()` and
+   * surface through `subscribe()`'s `onError`.
+   */
+  failureRate?: number;
+  /**
+   * Source of randomness, defaults to `Math.random`. Inject a deterministic
+   * generator in tests to assert failure behaviour reproducibly.
+   */
+  random?: () => number;
 }
 
 /**
@@ -45,17 +62,38 @@ export class MockGraphQLIndexer {
   private readonly queries: MockQueryMap;
   private readonly subscriptions: MockSubscriptionMap;
   private readonly strict: boolean;
+  private readonly latencyMs: number;
+  private readonly failureRate: number;
+  private readonly random: () => number;
   private _destroyed = false;
 
   constructor(options: MockIndexerOptions = {}) {
     this.queries = options.queries ?? {};
     this.subscriptions = options.subscriptions ?? {};
     this.strict = options.strict ?? false;
+    this.latencyMs = options.latencyMs ?? 0;
+    this.failureRate = options.failureRate ?? 0;
+    this.random = options.random ?? Math.random;
+  }
+
+  private async delay(): Promise<void> {
+    if (this.latencyMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.latencyMs));
+    }
+  }
+
+  /** True when the next operation should be simulated as a dropped connection. */
+  private shouldFail(): boolean {
+    return this.failureRate > 0 && this.random() < this.failureRate;
   }
 
   async query(options: GraphQLQueryOptions): Promise<unknown> {
     if (this._destroyed) {
       throw new Error("MockGraphQLIndexer has been destroyed");
+    }
+    await this.delay();
+    if (this.shouldFail()) {
+      throw new Error("MockGraphQLIndexer: simulated RPC connection drop");
     }
     const q = options.query.trim();
     if (q in this.queries) {
@@ -76,16 +114,20 @@ export class MockGraphQLIndexer {
     const q = options.query.trim();
     const events = this.subscriptions[q] ?? [];
 
-    // Emit events on next tick so the caller can attach listeners first.
+    let unsubscribed = false;
+    // Emit events on next tick so the caller can attach listeners first,
+    // applying the configured latency and dropping some at random (#911).
     const timers = events.map((evt, i) =>
       setTimeout(() => {
-        if (!unsubscribed) {
-          options.onData(evt);
+        if (unsubscribed || this._destroyed) return;
+        if (this.shouldFail()) {
+          options.onError?.(new Error("MockGraphQLIndexer: simulated RPC connection drop"));
+          return;
         }
-      }, i * 10),
+        options.onData(evt);
+      }, (i * 10) + this.latencyMs),
     );
 
-    let unsubscribed = false;
     return {
       unsubscribe: () => {
         if (unsubscribed) return;
