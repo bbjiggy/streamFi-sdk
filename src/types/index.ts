@@ -85,36 +85,29 @@ export enum StreamState {
 }
 
 /**
- * High-level, UI-friendly lifecycle status for a stream, derived client-side
- * from its on-chain {@link StreamInfo}.
+ * Identifies the vesting schedule shape a stream follows.
  *
- * Unlike {@link StreamState} (which mirrors the contract's coarse lifecycle),
- * `StreamStatus` adds the `Created` (scheduled, not yet started) and
- * `Completed` (reached its natural `endTime`) states so UI components can drive
- * switch statements without re-deriving them from disparate boolean flags
- * (`paused`, `cancelled`) and timestamp comparisons.
- */
-export enum StreamStatus {
-  Created = "Created",
-  Active = "Active",
-  Paused = "Paused",
-  Completed = "Completed",
-  Cancelled = "Cancelled",
-}
-
-/**
- * Derive a {@link StreamStatus} from a stream's {@link StreamInfo}.
+ * Numeric (not string) values, since this is meant to be passed across
+ * serialization boundaries (indexer payloads, stored UI state) cheaply.
  *
- * Resolution order: `Cancelled` → `Paused` → `Completed` (past `endTime`) →
- * `Created` (future `startTime`) → `Active`. `now` defaults to `Date.now()`
- * but may be injected for deterministic, time-independent tests.
+ * - `Linear`          — funds accrue at a constant `ratePerSecond` for the
+ *                        whole duration (the only shape the deployed
+ *                        DripStream contract currently streams — see
+ *                        {@link calculateAccruedAmount}).
+ * - `CliffLinear`      — no accrual until a cliff timestamp, then linear
+ *                        accrual for the remainder of the duration.
+ * - `ExponentialDecay` — accrual rate decreases exponentially over time
+ *                        rather than staying constant.
+ *
+ * `CliffLinear` and `ExponentialDecay` describe schedule shapes the SDK's
+ * types can represent for off-chain planning/UI purposes (e.g. a stream
+ * builder form, or an indexer that tags streams by intended shape) ahead of
+ * on-chain support; only `Linear` is currently enforced by the contract.
  */
-export function deriveStreamStatus(info: StreamInfo, now: number = Date.now()): StreamStatus {
-  if (info.cancelled) return StreamStatus.Cancelled;
-  if (info.paused) return StreamStatus.Paused;
-  if (info.endTime > 0 && now >= info.endTime) return StreamStatus.Completed;
-  if (info.startTime > now) return StreamStatus.Created;
-  return StreamStatus.Active;
+export enum StreamScheduleType {
+  Linear = 0,
+  CliffLinear = 1,
+  ExponentialDecay = 2,
 }
 
 export interface ConduitConfig {

@@ -703,6 +703,29 @@ try {
 | 2 | `InvalidParam` | Setter argument failed validation |
 | 3 | `AlreadyInitialized` | Governor has already been initialized |
 
+**Recovery hints**
+
+A raw Soroban panic looks like `HostError(Error(Contract, #14))` — a bare code with no
+indication of what to do about it. Every `ConduitError` (and `ContractError`, when the
+contract could be determined) carries a `recoveryHint` string with a suggested next step for
+its specific `contract` + `code`, in addition to the descriptive `message` above:
+
+```typescript
+import { getRecoveryHint, StreamErrorCode } from '@conduit-protocol/sdk';
+
+try {
+  await client.streams.forceCancel(streamId);
+} catch (err) {
+  if (err instanceof ConduitError) {
+    console.error(err.message);       // "force_cancel called before the 30-day pause threshold elapsed."
+    console.error(err.recoveryHint);  // "force_cancel requires the stream to have been paused for ..."
+  }
+}
+
+// Or look one up directly from a contract + code pair:
+getRecoveryHint('stream', StreamErrorCode.AlreadyInitialized);
+```
+
 ---
 
 ## Utilities

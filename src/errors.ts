@@ -104,6 +104,83 @@ const MESSAGES_BY_CONTRACT: Record<ConduitContract, Record<number, string>> = {
   governor: GOVERNOR_MESSAGES,
 };
 
+// ── Recovery hints ────────────────────────────────────────────────────────────
+//
+// A contract panic surfaces as `HostError(Error(Contract, #14))` — a bare
+// numeric code with no indication of what to actually do about it. These
+// hints are suggested next steps a caller (or a UI) can show alongside the
+// descriptive message above, so "AlreadyInitialized" becomes "this is a
+// one-time setup call" instead of a dead end.
+
+const STREAM_RECOVERY_HINTS: Record<StreamErrorCode, string> = {
+  [StreamErrorCode.NotAuthorized]:        'Verify the calling account matches the stream’s sender or recipient; sign with the correct keypair, wallet, or signer for this operation.',
+  [StreamErrorCode.StreamNotFound]:       'Confirm the stream ID exists and was created on the network you’re currently connected to (mainnet vs. testnet IDs do not overlap).',
+  [StreamErrorCode.StreamCancelled]:      'This stream was already cancelled — no further withdrawals, pauses, or resumes are possible. Create a new stream instead.',
+  [StreamErrorCode.StreamNotStarted]:     'Wait until the stream’s startTime is reached before withdrawing or otherwise interacting with it.',
+  [StreamErrorCode.StreamEnded]:          'The stream has passed its endTime. Withdraw any remaining balance; no further streaming will occur.',
+  [StreamErrorCode.NothingToWithdraw]:    'Call withdrawable() first — the balance may already be fully withdrawn, or the stream may not have accrued anything yet.',
+  [StreamErrorCode.InsufficientDeposit]:  'Increase depositAmount or shorten durationSeconds so the resulting rate covers at least one second of streaming.',
+  [StreamErrorCode.InvalidTimeRange]:     'Ensure endTime (or stopTime) is strictly greater than startTime.',
+  [StreamErrorCode.AlreadyPaused]:        'The stream is already paused — call resume() before pausing it again.',
+  [StreamErrorCode.NotPaused]:            'The stream is not currently paused — pause() must be called before resume().',
+  [StreamErrorCode.ClawbackDisabled]:     'This stream was created with clawbackEnabled: false. Clawback is only available on streams created with that flag set.',
+  [StreamErrorCode.ArithmeticOverflow]:   'Reduce the amount, rate, or duration involved — the computation overflowed the contract’s 128-bit integer range.',
+  [StreamErrorCode.PauseThresholdNotMet]: 'force_cancel requires the stream to have been paused for at least 30 days. Wait for the threshold to elapse, or use cancel() instead if you’re authorized to.',
+  [StreamErrorCode.AlreadyInitialized]:   'This stream contract has already been initialized — initialize() is a one-time setup call per deployment.',
+  [StreamErrorCode.InvalidAmount]:        'Provide an amount greater than zero.',
+};
+
+const FACTORY_RECOVERY_HINTS: Record<FactoryErrorCode, string> = {
+  [FactoryErrorCode.NotInitialized]:      'The factory has not been initialized yet — this is normally done once during protocol deployment/governance setup.',
+  [FactoryErrorCode.InvalidDeposit]:      'depositAmount must be greater than zero.',
+  [FactoryErrorCode.InvalidRate]:         'The computed ratePerSecond must be greater than zero — check your depositAmount/durationSeconds math.',
+  [FactoryErrorCode.InvalidTimeRange]:    'Ensure endTime is strictly greater than startTime.',
+  [FactoryErrorCode.InsufficientDeposit]: 'Increase the deposit so it covers at least one second of streaming at the given rate across the full declared duration.',
+  [FactoryErrorCode.BackdatedStream]:     'startTime must be now or in the future — check for clock skew or a stale timestamp before building the transaction.',
+  [FactoryErrorCode.AlreadyInitialized]:  'The factory has already been initialized — this is a one-time setup call.',
+  [FactoryErrorCode.RateExceedsMax]:      'Lower ratePerSecond below the governor’s configured max_rate_per_second, or ask governance to raise the limit.',
+  [FactoryErrorCode.DurationTooShort]:    'Increase durationSeconds to at least the governor’s configured min_duration_seconds.',
+  [FactoryErrorCode.ArithmeticOverflow]:  'Reduce the deposit or duration involved — the validation computation overflowed.',
+};
+
+const GOVERNOR_RECOVERY_HINTS: Record<GovernorErrorCode, string> = {
+  [GovernorErrorCode.NotAuthorized]:      'Only the current governor authority can perform this action — verify you’re signing with the configured governor address.',
+  [GovernorErrorCode.InvalidParam]:       'Check fee_bps (must be ≤ 10,000) and any duration/rate parameters passed to setConfig — one of them failed validation.',
+  [GovernorErrorCode.AlreadyInitialized]: 'The governor has already been initialized — this is a one-time setup call.',
+};
+
+const RECOVERY_HINTS_BY_CONTRACT: Record<ConduitContract, Record<number, string>> = {
+  stream:   STREAM_RECOVERY_HINTS,
+  factory:  FACTORY_RECOVERY_HINTS,
+  governor: GOVERNOR_RECOVERY_HINTS,
+};
+
+/** Fallback hint for a code with no dedicated entry (e.g. {@link UNKNOWN_CONTRACT_ERROR_CODE}). */
+const DEFAULT_RECOVERY_HINT = 'No troubleshooting hint is available for this error code. Check the contract’s errors.rs and the Conduit protocol docs for its meaning.';
+
+/**
+ * Returns a human-readable, actionable troubleshooting hint for a
+ * contract-scoped error code — the suggested next step a caller (or a UI)
+ * can show alongside {@link ConduitError.message}. Falls back to
+ * {@link DEFAULT_RECOVERY_HINT} for codes the SDK's catalogue doesn't
+ * recognise for `contract` (including {@link UNKNOWN_CONTRACT_ERROR_CODE}).
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await client.streams.forceCancel(streamId);
+ * } catch (err) {
+ *   if (err instanceof ConduitError) {
+ *     console.error(err.message);       // "force_cancel called before the 30-day pause threshold elapsed."
+ *     console.error(err.recoveryHint);  // "force_cancel requires the stream to have been paused for ..."
+ *   }
+ * }
+ * ```
+ */
+export function getRecoveryHint(contract: ConduitContract, code: number): string {
+  return RECOVERY_HINTS_BY_CONTRACT[contract][code] ?? DEFAULT_RECOVERY_HINT;
+}
+
 // ── Network / chain validation ─────────────────────────────────────────────────
 
 /**
@@ -172,16 +249,23 @@ export class UnsupportedChainError extends Error {
  * Use {@link isConduitError} when you need a type guard instead of an
  * `instanceof` check (e.g. across bundle boundaries or when the error may
  * have been serialized).
+ *
+ * `recoveryHint` carries a suggested next step for the specific `code` (see
+ * {@link getRecoveryHint}) — useful for surfacing actionable guidance instead
+ * of a bare `HostError(Error(Contract, #14))`-style message in a UI or log.
  */
 export class ConduitError extends Error {
   readonly contract: ConduitContract;
   readonly code: number;
+  /** Suggested troubleshooting step for this error's `contract` + `code`. See {@link getRecoveryHint}. */
+  readonly recoveryHint: string;
 
   constructor(contract: ConduitContract, code: number, detail?: string) {
     super(detail ?? MESSAGES_BY_CONTRACT[contract][code] ?? `ConduitError(${contract}, #${code})`);
     this.name = 'ConduitError';
     this.contract = contract;
     this.code = code;
+    this.recoveryHint = getRecoveryHint(contract, code);
   }
 
   /**
@@ -1384,6 +1468,12 @@ export class ContractError extends Error {
   readonly code: number | undefined;
   /** The parsed diagnostic, when the code could be resolved to a contract. */
   readonly diagnostic: ContractErrorDiagnostic | undefined;
+  /**
+   * Suggested troubleshooting step for `code`, when `contract` is known
+   * (see {@link getRecoveryHint}); falls back to {@link DEFAULT_RECOVERY_HINT}
+   * when the contract couldn't be determined (e.g. an ambiguous code).
+   */
+  readonly recoveryHint: string;
 
   constructor(
     message: string,
@@ -1396,6 +1486,9 @@ export class ContractError extends Error {
     this.contract = contract;
     this.code = code;
     this.diagnostic = diagnostic;
+    this.recoveryHint = contract !== undefined && code !== undefined
+      ? getRecoveryHint(contract, code)
+      : DEFAULT_RECOVERY_HINT;
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
